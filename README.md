@@ -47,8 +47,56 @@ volume adjustment is repeated presses in one direction.
 Measured over six gestures: down-then-up took 0.978s to 1.234s, while the gap between two
 separate gestures never fell below 3.220s. The 2 second window sits in that gap.
 
-Known false positive: a multi-step volume adjustment that happens to end with one step back up
-looks identical. Not yet fixed.
+#### The five clauses
+
+A volume down-then-up has to satisfy all five of these to count as a gesture. They live in one
+commented block at the top of `bin/voice.py`, right next to the constants they describe, because
+the right numbers depend on your headset and your desktop and you will want to change them.
+
+| # | Clause | Knob | What it rejects |
+|---|---|---|---|
+| 1 | one change down, one change back up | not tunable | your desktop volume slider |
+| 2 | the return lands on the exact starting value | not tunable | an ordinary adjustment |
+| 3 | the drop is exactly this many units | `VOICE_GESTURE_STEP` | anything that is not a headset button |
+| 4 | at least this long between the two presses | `VOICE_GESTURE_MIN` | a fast ramp shaped like a press |
+| 5 | at most this long between them | `VOICE_GESTURE_WINDOW` | two unrelated adjustments |
+
+Clause 1 is the one nobody expects. Dragging a desktop volume slider down and back up sends a
+*run* of changes, and a detector that remembers only the most recent drop will arm on the last
+step down and fire on the first step back up. It looks identical to a real gesture in the log.
+A headset button sends exactly one change per press, and a slider sends many, which is the whole
+distinction.
+
+Clause 3 ships disabled, because the step size is a property of your headset rather than of this
+software, and a wrong guess rejects every gesture you make. Every accepted gesture logs its step
+size, so make one, read the number off the log, and set it.
+
+When a pair arms and then fails, the log says which clause rejected it and why:
+
+```
+ignored a volume change (0.386s, step 1): failed shape (one down, one up)
+```
+
+#### Keep the baseline fresh, or lose the first gesture of every session
+
+Anyone writing a gesture detector will meet this one. The first gesture after starting the
+daemon does nothing, every time, while every later one works. It looks flaky and it is
+structural: recognising a drop needs a previous value to compare against, the first event is
+what supplies it, so the opening press gets spent creating the baseline rather than arming
+anything.
+
+Reading the volume when the headset connects is the obvious fix and it is not enough, which is
+the part worth knowing. Headsets announce one volume as they connect and settle on another
+moments later, so the baseline is already stale by the time anyone presses a button. The first
+press then reads as a move upward from a value that never existed, gets discarded, and the
+gesture works on the second try only because the first one corrected the baseline on its way
+past. Same symptom, different cause, and fixing the first one hides the second.
+
+So the daemon re-reads the true volume every couple of seconds while idle
+(`VOICE_GESTURE_RESYNC`), skipping any moment when a drop is waiting for its return or a command
+is already running. The connect and disconnect signals are still handled, but they are advisory:
+neither is guaranteed to carry a volume at the instant it fires, and the timer is what makes
+that not matter.
 
 ### Why it can answer a taste question
 
@@ -79,9 +127,133 @@ changes over time, so run `/model` in Claude Code to see what you have.
 would quietly spend a Pro plan's budget picking songs. Override with `VOICE_CLAUDE_MODEL` if
 your plan has room.
 
-Latency is roughly 20 seconds end to end, about half transcription and half dispatch. That is
-the honest number. `--effort low` is doing real work there: the CLI default is tuned for coding
-and spent 90 seconds on a single lyric lookup before it was added.
+Latency is roughly 20 to 40 seconds end to end, transcription plus dispatch. That is the honest
+number, and it is deliberate: see the next section for why the slow half is free.
+
+### It decides. It never asks you a question
+
+There is no reply channel. One gesture, one sentence, one command. So a question back is never
+a useful answer, and "I need more information" is never a reason. Ambiguous means pick.
+
+That sounds obvious and it was not the first behaviour. Two commands in one evening came back
+refused rather than answered: "the rest of the songs in this album" got "no current track is
+known", and "play some Birdman" got "which of the four albums?". Both left the previous song
+playing, which from across the room is indistinguishable from the thing being broken. Four
+things fix it, and they are worth copying if you build something similar:
+
+- **It knows what is playing.** The current track, its catalogue number and folder, the queue
+  position, and the next three tracks all go in the prompt. That is what "this song", "this
+  album", "the rest of it" and "something like this" resolve against. Nothing can answer those
+  without it.
+- **A megaplaylist parent is a playable target,** not only its children. `Birdman` shuffles
+  everything of theirs; `Birdman/Fast Money` plays the one album. Without the parent in the
+  list, "play some Birdman" has no legal answer at all, because the model is forbidden from
+  inventing a target.
+- **It can search the web** (`WebSearch` and `WebFetch`, and nothing else). For a
+  half-remembered lyric, or the one from that film, or who featured on what. The result is
+  mapped back onto catalogue numbers: searching decides which of your tracks to play, it never
+  adds a track you do not own.
+- **Playback resumes before dispatch, not after.** This is the piece that makes the other three
+  affordable. The music restarts the moment your sentence is transcribed, so the model can take
+  40 seconds to think and you hear music the whole time. The command lands a few seconds later
+  and sounds like an ordinary track change. Pausing across the thinking step is what makes a
+  slow, thorough answer feel broken.
+
+### Every decision is logged, with its reasoning
+
+If a tool is going to choose for you, you need to be able to see what it chose and why. So
+`why` is a required field on every command it can issue, not an optional note on the
+interesting ones: two or three sentences saying what it understood, what it picked, and what it
+ruled out. Every turn lands in `.state/voice.log` next to the transcript that produced it.
+
+```
+[23:32:11] heard: 'Put something on.'
+[23:32:25] decision: play "90's and 2000's Rap" (default order, from beginning)
+[23:32:25] why: No specific request was made, just 'put something on,' so I picked
+                the biggest, most varied megaplaylist in the library as a safe
+                general listen. I used order 'default' so it shuffles like a
+                playlist rather than playing four source folders in rigid sequence.
+```
+
+That log is also the only honest way to tune the thing. Every prompt rule in `voice.py` came
+from reading a turn that went wrong.
+
+### It talks while it thinks, and never the same way twice
+
+A thorough answer can take half a minute, and half a minute of silence is indistinguishable
+from a daemon that has crashed. So the moment your sentence is transcribed it says something,
+and the important part is the word *while*: the model call goes out first, on its own thread,
+and the spoken line plays over the top of it. The line is cover for the thinking, not a
+preamble to it. Your music comes back as the line ends.
+
+The wording is not fixed. A bank of eight lines sits pre-rendered on disk, each a different
+phrasing of the same two facts, hang on and the music is coming back. One gets played, then
+deleted, and the bank tops itself up in the background by asking Claude for fresh ones.
+
+They are written in character, and the character is a butler:
+
+```
+That is in hand. The music carries on in the interim.
+I have put the music back. Leave the rest with me.
+Play on a moment longer while I go and check.
+```
+
+**The character lives in `bin/ack-seed.txt`**, which is a brief rather than a script: a voice
+section, phrases that carry the register but are never to be quoted, and a list of things to
+avoid. Rewrite it and your player becomes a ship's computer, or a bored teenager, or whatever
+you like. Nothing is quoted verbatim, so no line ever becomes a catchphrase, and
+`VOICE_ACK_SEED` can point at a different file if you want to keep several.
+
+Editing it retires the whole bank within about twenty seconds, no restart needed. That part is
+worth stating because the obvious implementation is wrong: re-reading the persona when the bank
+tops up only changes the next line *written*, while the seven already rendered keep playing in
+the old voice for seven more commands, which looks exactly like an edit that did nothing. So the
+file's content is hashed, and a changed hash retires every rendered line. Comments are stripped
+before hashing, so annotating the file is free.
+
+Pre-rendering is the whole trick. Writing and voicing a line on demand would put three seconds
+of silence exactly where the silence already was, which is what the line exists to cover.
+
+`setup.sh` installs no TTS engine, so the daemon uses whatever you have: point `VOICE_PIPER`
+and `VOICE_PIPER_MODEL` at a Piper binary and voice for the good version, or let it fall back
+to espeak-ng or pico2wave. With none of them, or with no Claude to write new lines, it falls
+back to one fixed sentence and then to saying nothing, and every other part still works.
+`VOICE_ACK=0` turns it off and `VOICE_ACK_WAV` plays your own recording instead.
+
+There is 400ms of silence baked into the front of every clip. A bluetooth headset that has been
+quiet for a few seconds clips the first word while its link wakes up, and these play after
+exactly that kind of pause.
+
+### Your headset's microphone does not exist until you ask for it
+
+This is the part that will cost you an evening if nobody tells you. A bluetooth headset playing
+music is in A2DP, and **A2DP has no microphone**. The input node is still there in your audio
+graph, it still shows up as a source, and it will happily hand you two seconds of near silence.
+Nothing errors, because nothing failed. Every command just comes back as "heard nothing".
+
+Measured on one box: the internal mic read 349 RMS across two seconds of a quiet room, the
+headset's input node read 22, and speech onset triggers at 180.
+
+The mic only appears when the card is switched into a call profile, which costs you audio
+quality. So the daemon switches, per turn, in this order:
+
+```
+gesture -> pause the music -> headset into its call profile -> capture ->
+headset back to A2DP -> think and speak -> resume music -> act
+```
+
+Pausing first is what makes the quality hit free. The profile is only narrowband while nothing
+is playing through it, and by the time your music comes back you are in A2DP again. The point
+of all this is range: you can be in another room with your hands in the sink.
+
+Two details worth copying. Nothing is cached, because device ids and profile indexes are handed
+out by the session manager and change across reboots and reconnects, so they are re-read every
+turn. And the switch back runs from a `finally`, with a second check at startup, because a
+headset left in its call profile sounds broken for the rest of the evening.
+
+With no headset connected it falls back to whatever `VOICE_SOURCE` names, which is worth pinning
+to a real microphone rather than leaving as `default`. `VOICE_BT=0` disables the profile
+switching entirely.
 
 ### Accuracy is a vocabulary problem, not a model size problem
 
@@ -227,7 +399,11 @@ MEGAPLAY_MUSIC="/mnt/media/music"
 ```
 
 Voice control additionally needs the Claude Code CLI, a paid Claude plan, a bluetooth headset
-with volume buttons, and `mpv-mpris` for media key support.
+with volume buttons, and `mpv-mpris` for media key support. To use the headset's own microphone
+it also needs PipeWire with `wpctl` and `pw-dump`, since reaching that microphone means moving
+the headset between audio profiles, and `bluetoothctl` to recover one that reconnects without
+its A2DP profile. For the spoken acknowledgement, point `VOICE_PIPER` at a Piper binary and
+voice, or install `espeak-ng`; with neither it stays silent and everything else still works.
 
 ⚠️ Re-run `bin/voice.sh install` after changing anything in `env.local.sh`. systemd launches
 the services directly and inherits nothing from your shell, so the values are baked into the
@@ -285,9 +461,13 @@ to an ID or every lookup will hit the wrong endpoint.
   listener talks to BlueZ over D-Bus. None of that is portable to macOS or Windows as written.
 - **Voice control needs a paid Claude plan.** There is no free tier path and no local-model
   fallback yet.
-- **~20 seconds per voice command.** Fine for "put something on", too slow to feel like a
-  remote control.
-- **The gesture has a known false positive** (see above).
+- **20 to 40 seconds per voice command.** Fine for "put something on", too slow to feel like a
+  remote control. Your music is playing for most of it.
+- **The gesture is a volume pattern, so it can only ever be heuristic.** The five clauses reject
+  every false trigger seen so far, but they are thresholds rather than proof, and a headset that
+  reports volume differently will need them retuned.
+- **Speaking to it drops your audio to call quality for a few seconds.** That is what having a
+  headset microphone costs. The music is paused throughout, so you should not hear it.
 - **YouTube throttles long download runs.** yt-dlp starts failing across unrelated tracks after
   a while. It is the IP being throttled, not the songs, and the same tracks succeed later.
   Stopping and resuming is safe: nothing partial is left behind and a re-run fills only gaps.
@@ -314,7 +494,9 @@ megaplay is a thin orchestration layer. Nearly all the hard work belongs to othe
 | [OpenAI Whisper](https://github.com/openai/whisper) | MIT | The speech recognition models themselves |
 | [mutagen](https://github.com/quodlibet/mutagen) | **GPL-2.0-or-later** | All ID3 tag reading and writing |
 | [Claude Code](https://claude.com/product/claude-code) | proprietary | Turns a spoken sentence into a track selection |
-| rsync, BlueZ, PyGObject, NumPy | various | Phone sync, the gesture signal, D-Bus, audio maths |
+| [PipeWire / WirePlumber](https://pipewire.org/) | MIT | Audio routing, and the profile switching that reaches a headset microphone |
+| [Piper](https://github.com/rhasspy/piper) | MIT | Optional, voices the spoken acknowledgement |
+| rsync, BlueZ, PyGObject, NumPy | various | Phone sync, the gesture signal and headset reconnects, D-Bus, audio maths |
 
 **None of these are bundled or redistributed here.** `setup.sh` installs them from PyPI and
 your distro's package manager, onto your machine. That matters for more than tidiness: megaplay

@@ -34,7 +34,11 @@ need rsync    "phone sync"
 need mpv      "playback"
 
 # Optional: only some paths need these, so name them but do not block.
-for opt in socat findmnt gio; do
+#   wpctl, pw-dump   voice control switches the headset into a call profile to
+#                    reach its microphone, and reads the card back to confirm it
+#   bluetoothctl     reconnects a headset that came back without its A2DP profile
+#   espeak-ng        renders the spoken acknowledgement if you have no piper
+for opt in socat findmnt gio wpctl pw-dump bluetoothctl espeak-ng; do
   command -v "$opt" >/dev/null 2>&1 && ok "$opt" || warn "$opt missing (some features degrade)"
 done
 

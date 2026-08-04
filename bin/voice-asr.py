@@ -85,11 +85,16 @@ def vocabulary():
     return "Music library: " + ", ".join(sorted(names)) + "."
 
 
-def record_one():
-    """Capture a single utterance.
+def record_one(source):
+    """Capture a single utterance from `source`.
 
     Returns (pcm_bytes, reason). reason is "ok", "no_speech" (you never started
     talking), or "stream_died" (ffmpeg hit EOF early - see the caller's retry).
+
+    The source is passed per request rather than fixed at startup, because the
+    caller decides it: when a bluetooth headset is connected it switches that
+    headset into a call profile and hands over its mic node, and when it isn't
+    the capture falls back to SOURCE.
     """
     # stderr is NOT discarded: it inherits the server's, so ffmpeg's own error
     # text lands in voice-asr.log. Swallowing it once already cost a debugging
@@ -97,7 +102,7 @@ def record_one():
     # from a mic that heard nothing.
     ff = subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "pulse", "-i", SOURCE, "-ac", "1", "-ar", str(SR),
+         "-f", "pulse", "-i", source, "-ac", "1", "-ar", str(SR),
          "-f", "s16le", "pipe:1"],
         stdout=subprocess.PIPE, bufsize=FBYTES)
     try:
@@ -169,12 +174,16 @@ def main():
     while True:
         conn, _ = srv.accept()
         try:
-            req = conn.recv(64).decode(errors="replace").strip()
+            # Long enough for a PipeWire node name, which runs past 80 chars.
+            req = conn.recv(256).decode(errors="replace").strip()
             if not req.startswith("LISTEN"):
                 conn.sendall(b"\n")
                 continue
+            # "LISTEN [source]" - the argument is optional and back-compatible.
+            source = req[len("LISTEN"):].strip() or SOURCE
+            print(f"capturing from {source}", flush=True)
             with lock:
-                pcm, reason = record_one()
+                pcm, reason = record_one(source)
                 # A Bluetooth source can be torn down and recreated the first
                 # time something opens it, which kills the in-flight capture.
                 # One retry costs under a second and turns a dead turn into a
@@ -182,7 +191,7 @@ def main():
                 if reason == "stream_died":
                     print("capture died early - retrying once", flush=True)
                     time.sleep(0.6)
-                    pcm, reason = record_one()
+                    pcm, reason = record_one(source)
             if not pcm:
                 print(f"no audio ({reason})", flush=True)
                 conn.sendall(b"\n")
