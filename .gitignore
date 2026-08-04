@@ -1,0 +1,25 @@
+# Machine-specific paths. Never committed.
+bin/env.local.sh
+
+# Your library registry. The example file is the one that ships.
+playlists.tsv
+
+# Runtime state and caches
+.state/
+index/
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Audio never belongs in this repo. Your music lives in ~/Music.
+# This is the one rule here that is not just tidiness: a repo that ships code
+# is a tool, a repo that ships songs is something else entirely.
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.ogg
+*.opus
+*.aac
+*.wma
