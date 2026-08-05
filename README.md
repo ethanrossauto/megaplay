@@ -1,5 +1,7 @@
 # megaplay
 
+[![CI](https://github.com/ethanrossauto/megaplay/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanrossauto/megaplay/actions/workflows/ci.yml)
+
 A local music library manager for Linux, with voice control.
 
 It keeps a curated set of MP3s on disk, tags them so a phone groups them the way you actually
@@ -408,6 +410,26 @@ voice, or install `espeak-ng`; with neither it stays silent and everything else 
 ⚠️ Re-run `bin/voice.sh install` after changing anything in `env.local.sh`. systemd launches
 the services directly and inherits nothing from your shell, so the values are baked into the
 unit files at install time.
+
+### Checking the clone works
+
+```sh
+bash tests/run.sh
+```
+
+Roughly a minute, and it downloads nothing. It lints every script, exercises the registry
+helpers in a throwaway copy of the tree with an empty library, runs the tagging, album-collapse
+and dedupe passes over mp3s it generates with ffmpeg, and replays ten volume sequences through
+the gesture detector.
+
+Anything it cannot check on your machine prints `SKIP` with the reason and is listed again in
+the summary, so a missing tool never reads as a pass. Optional dependencies for the fuller run
+are `shellcheck`, `ffmpeg`, `python3-gi` and any Python with `mutagen`. Run one group at a time
+with `bash tests/run.sh T3`.
+
+The badge at the top is the same suite on GitHub's runners, plus a weekly job that installs
+from scratch. That one exists because the likeliest way this breaks for you is not a change
+here: it is spotdl or yt-dlp moving upstream.
 
 ---
 

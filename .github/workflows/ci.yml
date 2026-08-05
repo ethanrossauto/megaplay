@@ -1,0 +1,75 @@
+# Everything real lives in tests/run.sh, and this file only installs what that script needs
+# and calls it. Two reasons. Anyone can reproduce a red build locally with one command instead
+# of reading yaml, and a test that can only run on a GitHub runner is a test nobody runs before
+# pushing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The weekly run is the point of this file. This project's most likely breakage is not a
+  # change here at all: it is spotdl or yt-dlp moving underneath it, which turns a working
+  # clone into a broken one with nothing committed. A scheduled fresh install catches that
+  # while nobody is looking.
+  # Note: GitHub disables scheduled workflows after 60 days with no repository activity.
+  schedule:
+    - cron: '17 6 * * 1'
+
+# Read-only, and no secrets are used anywhere in this file.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Two Ubuntu versions for the bash and python spread, since "it works on my machine" is
+      # the failure this whole workflow exists to catch.
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      # python3-gi is what bin/voice.py imports at module level, so the gesture clauses cannot
+      # be tested without it. python3-mutagen stands in for the spotdl venv, which is 400 MB
+      # for one library the tagging tests need.
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            shellcheck ffmpeg python3-gi python3-mutagen
+
+      - name: Run the suite
+        run: bash tests/run.sh
+
+  fresh-install:
+    name: fresh install, as a downloader runs it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup.sh refuses to continue without these and prints the install line for the
+      # distro it is on. That behaviour is part of what is being tested.
+      - name: Install the system tools setup.sh requires
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg rsync mpv python3-venv
+
+      # Deliberately NOT cached. A cached spotdl would pass this job forever while a fresh
+      # clone on someone else's machine breaks, which is the exact failure being watched for.
+      - name: ./setup.sh --no-voice
+        run: ./setup.sh --no-voice
+
+      - name: The venv it built actually runs
+        run: ~/.local/spotdl-venv/bin/spotdl --version
+
+      - name: Tagging pipeline, against the real spotdl venv
+        run: bash tests/run.sh T4

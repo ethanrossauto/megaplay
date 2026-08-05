@@ -13,6 +13,10 @@ else
   find "$MUSIC" -name '*.mp3' > "$MPV_PLAYLIST"
 fi
 n=$(wc -l < "$MPV_PLAYLIST")
+# The quotes around $scope are literal decoration inside a double-quoted ${var:+...}, so it
+# does expand: "No songs to play in 'Fire Rock'." shellcheck reads the nesting as raw single
+# quotes and warns anyway. Verified both branches by hand.
+# shellcheck disable=SC2016
 [ "$n" -gt 0 ] || { echo "No songs to play${scope:+ in '$scope'}."; exit 1; }
 rm -f "$MPV_SOCK"
 # NOTE: mpv-mpris auto-loads from /etc/mpv/scripts/mpris.so - do NOT also pass --script,
@@ -23,6 +27,7 @@ setsid mpv --no-video --shuffle --loop-playlist=inf \
 disown
 sleep 2
 if pgrep -x mpv >/dev/null; then
+  # shellcheck disable=SC2016
   echo "Playing $n songs${scope:+ from '$scope'} (shuffled, looping)."
 else
   echo "mpv failed to start; see /tmp/spotify-mpv.log"; exit 1

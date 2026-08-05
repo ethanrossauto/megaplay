@@ -198,13 +198,21 @@ start_ts=$(date +%s)   # to prove same-name replacements actually happened (mtim
 # to be re-fetched by hand. Back every target up first; restore any whose swap did not land.
 backup="$STATE/explicit-backup"
 mkdir -p "$backup"
+# The field names spell out the plan file's layout, so they all get named even where this
+# loop only needs two of them.
+# shellcheck disable=SC2034
 while IFS=$'\t' read -r bname bclean burl bnewf; do
   [ -f "$MUSIC/$bname/$bclean" ] && cp -p "$MUSIC/$bname/$bclean" "$backup/$(slug "$bname/$bclean")"
 done < "$plan"
 # Batch the URLs: a long list of individual track URLs makes spotdl do a Spotify lookup each and
 # it stalls on rate limits (same trap documented for batch grabs in CLAUDE.md).
 awk -F'\t' '{print $1}' "$plan" | sort -u | while IFS= read -r name; do
-  urls=(); while IFS=$'\t' read -r n f u nf; do [ "$n" = "$name" ] && urls+=("$u"); done < "$plan"
+  # pname, not n: `n` is the plan's total line count, printed in the summary at the end. The
+  # pipeline above makes this a subshell so the outer n survives today, but a reader cannot
+  # see that from here and a later rewrite would silently print a playlist name as the total.
+  urls=()
+  # shellcheck disable=SC2034
+  while IFS=$'\t' read -r pname f u nf; do [ "$pname" = "$name" ] && urls+=("$u"); done < "$plan"
   echo "  $name: ${#urls[@]} track(s)"
   for ((i=0; i<${#urls[@]}; i+=10)); do
     batch=("${urls[@]:i:10}")
@@ -232,6 +240,7 @@ done
 #  - twin has the SAME filename: --overwrite force rewrote it in place, so prove it by mtime
 #    rather than assuming (a silent no-op here is exactly the bug that hid on 2026-07-26).
 removed=0; inplace=0; failed=0; restored=0
+# shellcheck disable=SC2034
 while IFS=$'\t' read -r name clean url newf; do
   bak="$backup/$(slug "$name/$clean")"
   if [ "$newf" != "$clean" ]; then

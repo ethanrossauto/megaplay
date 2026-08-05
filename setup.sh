@@ -39,7 +39,8 @@ need mpv      "playback"
 #   bluetoothctl     reconnects a headset that came back without its A2DP profile
 #   espeak-ng        renders the spoken acknowledgement if you have no piper
 for opt in socat findmnt gio wpctl pw-dump bluetoothctl espeak-ng; do
-  command -v "$opt" >/dev/null 2>&1 && ok "$opt" || warn "$opt missing (some features degrade)"
+  if command -v "$opt" >/dev/null 2>&1; then ok "$opt"
+  else warn "$opt missing (some features degrade)"; fi
 done
 
 if [ ${#missing[@]} -gt 0 ]; then

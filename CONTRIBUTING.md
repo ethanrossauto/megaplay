@@ -35,6 +35,9 @@ invoke spotdl at all.
 
 ## House rules for patches
 
+- **Run `bash tests/run.sh` before opening a pull request.** It needs no network and takes about
+  a minute. CI runs the same script, so a green run locally is a green run there, and a red one
+  tells you what to fix without waiting on a runner.
 - Shell is bash with `set -u`. Keep it POSIX-ish where it is free to do so.
 - **Never monitor a background job with `pgrep -f <script name>`.** It matches the monitor's own
   command line, so the loop never sees the job end and spins forever. This has bitten this

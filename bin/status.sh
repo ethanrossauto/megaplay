@@ -6,6 +6,9 @@ printf '%-44s %6s %5s %7s %8s\n' "PLAYLIST" "ONDISK" "CAP" "OFFSET" "INDEXED"
 printf '%-44s %6s %5s %7s %8s\n' "--------" "------" "---" "------" "-------"
 total=0
 prev_parent=""
+# The registry's four columns are all named so the layout reads off this line; playlist_id
+# is not needed here.
+# shellcheck disable=SC2034
 while IFS=$'\t' read -r name pid cap off; do
   [ "$name" = "name" ] && continue
   [ -z "$name" ] && continue

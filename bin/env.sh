@@ -2,6 +2,10 @@
 # Shared environment + helpers. Source this from every other script:
 #   source "$(dirname "$0")/env.sh"
 
+# Nearly everything set here is read by the scripts that SOURCE this file, never by this file
+# itself, so shellcheck sees a file full of unused variables. That is the point of the file.
+# shellcheck disable=SC2034
+
 # Project root, derived from where THIS file sits rather than hardcoded, so the
 # tree works from whatever directory it was cloned into. BASH_SOURCE (not $0)
 # because $0 is the calling script, and every caller lives in this same bin/.
@@ -10,6 +14,8 @@ PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Machine-specific overrides live here and are gitignored, so a path that is
 # true on one box never ends up in the repo. Sourced BEFORE the defaults below
 # so everything it sets wins the ${VAR:-default} expansions.
+# Gitignored and absent in a fresh clone, by design, so there is nothing for shellcheck to follow.
+# shellcheck source=/dev/null
 [ -f "$PROJECT/bin/env.local.sh" ] && . "$PROJECT/bin/env.local.sh"
 
 MUSIC="${MEGAPLAY_MUSIC:-$HOME/Music}"     # the local library (also the phone-sync source)
@@ -102,7 +108,7 @@ stop_downloads() {
   local self=$$
   for pid in $(pgrep -x python3) $(pgrep -x yt-dlp) $(pgrep -x spotdl); do
     [ "$pid" = "$self" ] && continue
-    local cmd; cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+    local cmd; cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
     case "$cmd" in
       *mpv*|*mpris*) continue;;
       *"spotdl download"*|*yt-dlp*|*"spotdl save"*) kill -9 "$pid" 2>/dev/null;;
