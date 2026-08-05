@@ -81,6 +81,20 @@ CASES = [
     # silent rather than logged. This is the shape the very first event of a session takes.
     ("an up with no down is ignored silently",
      [(48, 1.0)], 40, 0, ""),
+
+    # "The first gesture never works", part 3, reported 2026-08-04 and fixed the same morning.
+    # A headset settling to a lower volume after it connects is a DOWN with no matching UP. It
+    # used to arm the detector forever, because only an UP cleared down_from, so the next real
+    # press read as the second drop of a ramp and died on clause 1. The log said it exactly:
+    # "ignored a volume change (0.745s, step 8): failed shape", then a clean gesture four
+    # seconds later. An arm past the window is now discarded instead.
+    ("a phantom settle long ago does not eat the next real gesture",
+     [(40, 0.0), (32, 100.0), (40, 101.0)], 48, 1, "discarded a stale arm"),
+
+    # The other half of the same fix: a FRESH arm must still block, or clause 1 is gone and the
+    # GNOME volume slider fires the mic again.
+    ("a drop half a second ago still counts as a ramp",
+     [(40, 0.0), (32, 0.5), (40, 1.5)], 48, 0, "shape"),
 ]
 
 failures = []

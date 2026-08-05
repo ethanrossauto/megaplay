@@ -1358,9 +1358,22 @@ class Gesture:
         """Seed the baseline without counting it as a press."""
         self.prev, self.down_from, self.dragging = vol, None, False
 
-    def armed(self):
-        """Mid-gesture: a drop is waiting for its return. Do not resync now."""
-        return self.down_from is not None
+    def armed(self, now=None):
+        """Mid-gesture: a drop is waiting for its return. Do not resync now.
+
+        An arm OLDER than the window is not mid-gesture, it is debris, and
+        saying otherwise is what made "the first gesture never works" survive
+        two fixes. A drop with no matching up - a headset settling to a lower
+        volume after it connects, a single press nobody completed - used to arm
+        the detector forever, because only an UP cleared it. That stuck arm then
+        did two things: it marked the next real press as a drag, so the gesture
+        failed clause 1, and it switched off resync() permanently, since resync
+        skips while armed. The one mechanism built to repair a stale baseline
+        was disabled by exactly the state it existed to repair.
+        """
+        if self.down_from is None:
+            return False
+        return (time.monotonic() if now is None else now) - self.down_at <= GESTURE_WINDOW
 
     def feed(self, vol, now):
         prev, self.prev = self.prev, vol
@@ -1368,6 +1381,15 @@ class Gesture:
             return
 
         if vol < prev:                                   # a change DOWNWARD
+            # An arm past the window can never become a gesture - clause 5 would
+            # reject it - so it is not a drag partner either. Discard it instead
+            # of letting it call this press part of a ramp. resync() heals this
+            # too, but only every couple of seconds, and a press can land inside
+            # that gap.
+            if self.down_from is not None and now - self.down_at > GESTURE_WINDOW:
+                log(f"discarded a stale arm ({now - self.down_at:.1f}s old, "
+                    "no matching volume up)")
+                self.down_from, self.dragging = None, False
             # Already armed means this is the second drop in a row, so whatever
             # is moving the volume is not a button. Clause 1.
             self.dragging = self.dragging or self.down_from is not None

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# megaplay's test suite. Runs here and in CI: the GitHub workflow is a thin wrapper around
-# this file, so anything it checks can be reproduced locally with one command.
+# The test suite for this project, and it runs on BOTH sides of the mirror pair: the private
+# working repo where bin/ is edited, and the public mirror where CI is a thin wrapper around
+# this same file.
 #
-#   bash tests/run.sh              every group that can run on this machine
+#   bash tests/run.sh              every group that can run here
 #   bash tests/run.sh T3 T5        just those groups
 #
 # It touches no network, calls neither Spotify nor YouTube, and commits no audio: the mp3s in
@@ -10,10 +11,22 @@
 #
 # 🔒 A group that cannot run reports SKIP and is counted in the summary. It is never silently
 # a pass. A check that cannot tell "nothing wrong" from "I could not look" is not a check.
+#
+# ONE FILE, NOT TWO. Four groups are about the code (lint, fresh clone, metadata, gesture) and
+# are identical wherever they run. Two are about the published artifact (T2 hygiene, T6 docs)
+# and mean nothing in the private repo, where a tracked CLAUDE.md, real paths and a real
+# playlists.tsv are all correct. One is about the real library (T7) and there is no library in
+# the mirror. Those three SKIP with a reason on the side they do not apply to, rather than
+# living in a second file that would drift from this one.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
+
+# Which side of the pair is this? Decided by a file, not a heuristic: .mirror-manifest is the
+# private repo's declaration of what may cross, so only the private side carries one. A
+# downloader's clone has no manifest and correctly reads as the public artifact.
+if [ -f "$ROOT/.mirror-manifest" ]; then SIDE="private"; else SIDE="public"; fi
 
 SHELLCHECK="${SHELLCHECK:-shellcheck}"
 PASS=0; FAIL=0; SKIPPED=0
@@ -59,6 +72,21 @@ want_group() {  # no arguments means all of them
 tracked() { git -C "$ROOT" ls-files 2>/dev/null; }
 is_repo()  { git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; }
 
+# The files this project ships, by extension. Tracked PLUS untracked-not-ignored, so a script
+# written this session is still linted, while a gitignored one is not: bin/env.local.sh is
+# machine-specific, has no shebang and is absent from a clone by design, so linting it would
+# report three findings that are all correct and none actionable. Outside a checkout (someone
+# unpacked a tarball) it falls back to walking the tree and excludes that file by name.
+list_files() {  # list_files '\.sh'
+  local rx="$1"
+  if is_repo; then
+    { tracked; git -C "$ROOT" ls-files --others --exclude-standard; } | sort -u | grep -E "$rx\$"
+  else
+    find . -path ./.git -prune -o -type f -print 2>/dev/null | sed 's|^\./||' \
+      | grep -E "$rx\$" | grep -v '^bin/env\.local\.sh$' | sort
+  fi
+}
+
 # A python that can import mutagen: the spotdl venv on a real install, the system one in CI
 # where python3-mutagen is a 1 MB apt package rather than a 400 MB venv.
 mutagen_python() {
@@ -77,10 +105,18 @@ mutagen_python() {
 t1_lint() {
   group "T1  lint"
   local f out broken=""
+  local -a sh_list py_list
+  mapfile -t sh_list < <(list_files '\.sh')
+  mapfile -t py_list < <(list_files '\.py')
+  printf '  ....  linting %s shell and %s python file(s)\n' "${#sh_list[@]}" "${#py_list[@]}"
+  if [ "${#sh_list[@]}" -eq 0 ]; then
+    bad "there are shell scripts to lint" "found none, which cannot be right. Refusing to report an empty run as clean."
+    return
+  fi
 
   # bash -n first, because it needs nothing installed. Even with no shellcheck on the box,
   # a syntax error still fails the suite rather than skipping it.
-  for f in bin/*.sh setup.sh tests/*.sh; do
+  for f in "${sh_list[@]}"; do
     out="$(bash -n "$f" 2>&1)" || broken="$broken$f: $out"$'\n'
   done
   assert_empty "every shell script parses (bash -n)" "$broken"
@@ -88,21 +124,21 @@ t1_lint() {
   if command -v "$SHELLCHECK" >/dev/null 2>&1; then
     # -P SCRIPTDIR so `source "$(dirname "$0")/env.sh"` resolves. Without it every caller
     # reports SC1091 "not following", 17 notes that say nothing about the code.
-    out="$("$SHELLCHECK" -x -P SCRIPTDIR bin/*.sh setup.sh tests/*.sh 2>&1)"
+    out="$("$SHELLCHECK" -x -P SCRIPTDIR "${sh_list[@]}" 2>&1)"
     assert_empty "shellcheck clean" "$out"
   else
     skip "shellcheck clean" "shellcheck not installed; set SHELLCHECK=<path> to point at one"
   fi
 
   broken=""
-  for f in bin/*.py; do
+  for f in "${py_list[@]}"; do
     out="$(python3 -m py_compile "$f" 2>&1)" || broken="$broken$f: $out"$'\n'
   done
   rm -rf bin/__pycache__
   assert_empty "every python file compiles" "$broken"
 
   broken=""
-  for f in bin/*.sh bin/*.py setup.sh tests/*.sh tests/*.py; do
+  for f in "${sh_list[@]}" "${py_list[@]}"; do
     [ -e "$f" ] || continue
     head -c 2 "$f" | grep -q '#!' || broken="$broken$f"$'\n'
     [ -x "$f" ] || broken="$broken$f (not executable)"$'\n'
@@ -134,6 +170,14 @@ t1_lint() {
 # ---------------------------------------------------------------------------
 t2_hygiene() {
   group "T2  publishing hygiene"
+  if [ "$SIDE" = "private" ]; then
+    # Not a weaker check here, a meaningless one. Every rule below is inverted in the private
+    # repo: CLAUDE.md is tracked and should be, ~/Claude paths are correct, playlists.tsv is
+    # real listening data, and the maintainer's name is ordinary. Running it here would print
+    # a wall of failures that say nothing, which is how a suite gets ignored.
+    skip "the whole publishing group" "private working repo; these rules describe the published mirror"
+    return
+  fi
   if ! is_repo; then
     skip "the whole hygiene group" "not a git checkout, so there is no tracked set to audit"
     return
@@ -218,7 +262,9 @@ t3_fresh_clone() {
   local proj="$TMP/t3/proj" home="$TMP/t3/home" music="$TMP/t3/music"
   mkdir -p "$proj" "$home" "$music"
   cp -r bin "$proj/bin"
-  cp setup.sh playlists.tsv.example "$proj/"
+  # Both are NATIVE to the mirror and absent from the private repo. bin/ is what this group
+  # actually exercises, so their absence changes nothing.
+  for f in setup.sh playlists.tsv.example; do [ -e "$f" ] && cp "$f" "$proj/"; done
   rm -f "$proj/bin/env.local.sh"
   rm -rf "$proj/bin/__pycache__"
 
@@ -424,7 +470,14 @@ t5_gesture() {
 # T6  the README still describes the code
 # ---------------------------------------------------------------------------
 t6_docs() {
-  group "T6  docs match the code"
+  # Each side has one document that lists the commands, and it is a different document:
+  # README.md is written for a downloader, CLAUDE.md for whoever works on this next. Same
+  # check either way, which is why this group is not mirror-only.
+  local doc; [ "$SIDE" = "private" ] && doc="CLAUDE.md" || doc="README.md"
+  group "T6  docs match the code ($doc)"
+  if [ ! -f "$doc" ]; then
+    skip "docs match the code" "no $doc in this tree"; return
+  fi
   # env.sh is sourced, never run; index-playlist.sh is called by more.sh rather than by hand.
   local exempt="env.sh index-playlist.sh"
   local f base missing="" phantom=""
@@ -432,22 +485,68 @@ t6_docs() {
   for f in bin/*.sh bin/voice.py; do
     base="$(basename "$f")"
     case " $exempt " in *" $base "*) continue;; esac
-    grep -q "bin/$base" README.md || missing="$missing$base"$'\n'
+    grep -q "bin/$base" "$doc" || missing="$missing$base"$'\n'
   done
-  assert_empty "every command is documented in the README" "$missing" \
+  assert_empty "every command is documented in $doc" "$missing" \
     "a command nobody can find is a command nobody runs"
 
   while read -r base; do
     [ -n "$base" ] || continue
     [ -e "$ROOT/$base" ] || phantom="$phantom$base"$'\n'
-  done < <(grep -oE 'bin/[a-z-]+\.(sh|py)' README.md | sort -u)
-  assert_empty "the README names no command that does not exist" "$phantom"
+  done < <(grep -oE 'bin/[a-z-]+\.(sh|py)' "$doc" | sort -u)
+  assert_empty "$doc names no command that does not exist" "$phantom"
+}
+
+# ---------------------------------------------------------------------------
+# T7  the real library, private side only
+#
+# Not about the code: about the state the code has produced on this machine. Both checks are
+# ones CLAUDE.md currently tells you to run by hand, which is the same as saying nobody runs
+# them. Read-only, and it never touches the audio.
+# ---------------------------------------------------------------------------
+t7_library() {
+  group "T7  library state"
+  if [ "$SIDE" != "private" ]; then
+    skip "library state" "public mirror, and there is no library here by design"; return
+  fi
+  local music="${MEGAPLAY_MUSIC:-$HOME/Music}"
+  if [ ! -d "$music" ]; then
+    skip "library state" "no library at $music"; return
+  fi
+
+  # The SD card is FAT32, so a name carrying any of ? * : < > | " \ downloads fine on ext4 and
+  # then cannot be copied across. Hit on 2026-08-01 by an album whose real title ends in a
+  # question mark. The fix is renaming the folder and its registry row; the ALBUM tag inside
+  # each file keeps the real spelling, so the phone still displays it correctly.
+  assert_empty "no FAT32-illegal characters in any name" \
+    "$(find "$music" -regex '.*[?*:<>|"\\].*' 2>/dev/null)" \
+    "rename the folder and its registry row, dropping the character"
+
+  # grab.sh seeds these to stop spotdl re-fetching a song a sibling folder already holds, and
+  # removes them in an EXIT trap. A leftover one silently blocks a legitimate re-download
+  # later, and only kill -9 on grab.sh leaves them behind.
+  assert_empty "no stale .mp3.skip files left by an interrupted grab" \
+    "$(find "$music" -name '*.mp3.skip' 2>/dev/null)" \
+    "delete them; a stale skip file blocks a re-download with no error"
+
+  # Every registry row should have a folder. The reverse is not a fault: an empty megaplaylist
+  # parent is a folder with no row on purpose, and status.sh reports those as empty.
+  local missing="" name
+  if [ -f "$ROOT/playlists.tsv" ]; then
+    while IFS=$'\t' read -r name _rest; do
+      [ "$name" = "name" ] || [ -z "$name" ] && continue
+      [ -d "$music/$name" ] || missing="$missing$name"$'\n'
+    done < "$ROOT/playlists.tsv"
+    assert_empty "every registry row has a folder on disk" "$missing"
+  else
+    skip "every registry row has a folder on disk" "no playlists.tsv"
+  fi
 }
 
 # ---------------------------------------------------------------------------
 
 WANTED=("$@")
-printf '%smegaplay test suite%s  (%s)\n' "$B" "$N" "$ROOT"
+printf '%stest suite%s  (%s, %s side)\n' "$B" "$N" "$ROOT" "$SIDE"
 
 want_group T1 && t1_lint
 want_group T2 && t2_hygiene
@@ -455,6 +554,7 @@ want_group T3 && t3_fresh_clone
 want_group T4 && t4_metadata
 want_group T5 && t5_gesture
 want_group T6 && t6_docs
+want_group T7 && t7_library
 
 printf '\n%s----- summary -----%s\n' "$B" "$N"
 printf '  %s%s passed%s, %s%s failed%s, %s%s skipped%s\n' \
