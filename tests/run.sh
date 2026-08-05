@@ -33,8 +33,10 @@ PASS=0; FAIL=0; SKIPPED=0
 FAILED_NAMES=(); SKIPPED_NAMES=()
 TMP=""
 
-# Invoked by the trap below, which shellcheck cannot see.
-# shellcheck disable=SC2329
+# Invoked by the trap below, which shellcheck cannot see. Both codes are needed: 0.10 and
+# later call this SC2329, while 0.9 reports the same thing as SC2317, and ubuntu-24.04 ships
+# 0.9. Suppressing only the code your own shellcheck emits passes locally and reddens CI.
+# shellcheck disable=SC2317,SC2329
 cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -360,9 +362,14 @@ t4_metadata() {
   local proj="$TMP/t4/proj" home="$TMP/t4/home" music="$TMP/t4/music" venv="$TMP/t4/venv"
   mkdir -p "$proj" "$home" "$music" "$venv/bin"
   cp -r bin "$proj/bin"; rm -f "$proj/bin/env.local.sh"; rm -rf "$proj/bin/__pycache__"
-  # env.sh reaches mutagen through $SPOTDL_VENV/bin/python. A symlink is enough to stand in
-  # for the real venv, and it keeps this group runnable without a 400 MB install.
-  ln -sf "$py" "$venv/bin/python"
+  # env.sh reaches mutagen through $SPOTDL_VENV/bin/python, so this stands one up rather than
+  # requiring a 400 MB install. It must be a WRAPPER, never a symlink: a venv python invoked
+  # through a symlink outside its own venv resolves sys.prefix to /usr and silently loses that
+  # venv's site-packages, so mutagen_python() would verify the real path and the test would then
+  # use a different interpreter. Harmless wherever the system python also carries mutagen, which
+  # is why it passed everywhere except the one CI job that installs no python3-mutagen.
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$py" > "$venv/bin/python"
+  chmod +x "$venv/bin/python"
 
   local run=(env HOME="$home" MEGAPLAY_MUSIC="$music" SPOTDL_VENV="$venv" bash)
 
