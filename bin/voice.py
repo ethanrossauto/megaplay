@@ -68,27 +68,67 @@ EFFORT = os.environ.get("VOICE_EFFORT", "medium")
 TOOLS = os.environ.get("VOICE_TOOLS", "WebSearch,WebFetch")
 
 # ===========================================================================
-# THE GESTURE CLAUSES - every knob for the trigger, in one place.
+# THE GESTURE CLAUSES - every knob for both triggers, in one place.
 #
-# A volume down-then-up must satisfy ALL FIVE to count. Each one is here
-# because something real got through without it, and each is tunable, because
-# the right numbers depend on your headset and your desktop.
+# TWO GESTURES, SAME FIVE CLAUSES, MIRRORED SHAPES (second one 2026-08-14):
 #
-#   1. SHAPE      exactly one change down, then one change back up.
+#   DOWN then UP    talk to it. Pauses, listens, asks, plays.
+#   UP then DOWN    the song you are hearing is CENSORED. Flags it, skips it.
+#
+# The second exists because censorship cannot be detected from metadata and,
+# as it turns out, not from the audio either. Spotify's explicit flag
+# describes the LISTING while the audio comes from a different source
+# entirely, so a track flagged explicit can still play clean. Transcribing
+# the audio and looking for the words fails in the other direction: a model
+# will not invent profanity, so finding it proves a track is uncensored, but
+# finding none proves nothing, because the model may simply have declined to
+# write it down. The larger model found FEWER hits than the small one on the
+# same files, which is the tell.
+#
+# So the only reliable detector is a person hearing it, and this gives that
+# person one flick to record what they heard, at the moment they hear it.
+# The flagged track is appended to the file named by FLAG_FILE below and
+# skipped immediately. Nothing is deleted: a flag is a label, and what to do
+# about it is a separate decision made later, with the list in hand.
+#
+# A gesture must satisfy ALL FIVE clauses to count. Each one is here because
+# something real got through without it, and each is tunable, because the
+# right numbers depend on your headset and your desktop.
+#
+#   1. SHAPE      exactly one change one way, then one change back.
 #                 Not tunable, and the most important of the five: a headset
 #                 button sends ONE change per press, while a volume slider
 #                 sends a run of them. Without this, dragging the desktop
 #                 slider down and back up fires the trigger, because the last
 #                 step of the ramp down and the first step of the ramp up are
 #                 a perfect pair. (2026-08-04, at 0.386s.)
-#   2. SYMMETRY   the return lands on the EXACT starting value.
+#                 It is the clause that keeps the two gestures apart, and it
+#                 does so for free: a ramp in either direction is refused
+#                 before the direction is ever consulted.
+#   2. SYMMETRY   the return lands on the EXACT starting value, OR the way back
+#                 up is one press of a known size (clause 3).
 #                 The original guard. A real adjustment rarely comes back to
-#                 where it began; a gesture always does.
-#   3. STEP       the drop equals GESTURE_STEP exactly. 0 accepts any size.
-#                 A button always moves the volume by the same amount, so a
-#                 different amount is something other than a button. Every
-#                 accepted gesture logs its step, so read yours off the log
-#                 before pinning it. This box's Q45 steps by 8 of 127.
+#                 where it began; a gesture always does. The second half of it
+#                 exists because the starting value is not always trustworthy:
+#                 see "the drifted baseline" below. With no step size pinned
+#                 there is nothing to recognise a press by, so the exact return
+#                 is all there is and this clause stays as strict as it was.
+#   3. STEP       the press is one of GESTURE_STEP. 0 accepts any size.
+#                 MEASURED ON THE WAY BACK UP where that lands on a known size,
+#                 and only otherwise on the way down. Both numbers in the rise
+#                 came from the headset; the drop is measured against a value
+#                 the headset may never have agreed with.
+#                 A button moves the volume by a fixed amount, so a different
+#                 amount is something other than a button. That amount is not
+#                 always ONE number, which is why this takes a comma-separated
+#                 list: the volume range is 0 to 127, that does not divide
+#                 evenly by the number of steps a headset has, and so most
+#                 presses move by N while a few land on N-1. Pinning a single
+#                 value kills the gesture at whichever volume sits on the odd
+#                 step and nowhere else, which reads as random flakiness rather
+#                 than as a setting. (2026-08-06: pinned to 8, dead at the one
+#                 volume where the drop measured 7.) Every accepted gesture
+#                 logs its step, so read yours off the log before pinning it.
 #   4. MIN GAP    at least GESTURE_MIN between the two presses.
 #                 Deliberate gestures measured 0.978s to 1.234s over six
 #                 tries. A slider ramp is far faster.
@@ -99,10 +139,46 @@ TOOLS = os.environ.get("VOICE_TOOLS", "WebSearch,WebFetch")
 #
 # A pair that arms and then fails logs WHICH clause rejected it, so tuning
 # these is a matter of reading the log rather than guessing.
+#
+# THE DRIFTED BASELINE - "the first gesture never works", part 4 (2026-08-09).
+# The headset's volume and the number this machine holds for it are two
+# different things, and they come apart: PipeWire writes an absolute volume of
+# its own on connect and on the profile round trip a command makes, and it does
+# not land on the headset's own 16-step grid. Nothing is wrong at that moment,
+# and nothing can see it either - re-reading BlueZ returns the same written
+# number, so resync() agrees with itself and "volume baseline corrected" had
+# never once appeared in the log.
+#
+# The next press is where it surfaces. It moves the headset by a real step, so
+# the drop measured against the drifted value comes out odd (5, 6, 9, 10, 11
+# were all logged), and the return lands on the headset's own value rather than
+# on the one being remembered, so clause 2 fails by exactly the drift. Then the
+# rejected press has just told BlueZ the truth, so the retry two seconds later
+# is clean - which is what made this look like flaky hardware for three days.
+#
+# So the way back up is measured instead, from two numbers the headset itself
+# reported. The drift is logged when it fires, because it is a real fault
+# somewhere else and should not be silently absorbed here.
 # ===========================================================================
 GESTURE_MIN = float(os.environ.get("VOICE_GESTURE_MIN", "0.6"))
 GESTURE_WINDOW = float(os.environ.get("VOICE_GESTURE_WINDOW", "2.0"))
-GESTURE_STEP = int(os.environ.get("VOICE_GESTURE_STEP", "0"))
+def parse_steps(spec):
+    """Clause 3's knob: a comma-separated list of accepted drop sizes.
+
+    An empty result means accept any size, which is what 0 asks for and also
+    what an unreadable value falls back to. The fallback is safe rather than
+    silent: the effective setting is printed on the ready line every start, so
+    a typo shows up as "step any" instead of as a gesture that never fires.
+    """
+    try:
+        got = frozenset(int(s) for s in spec.split(",") if s.strip())
+    except ValueError:
+        return frozenset()
+    return frozenset() if 0 in got else got
+
+
+GESTURE_STEP = parse_steps(os.environ.get("VOICE_GESTURE_STEP", "0"))
+GESTURE_STEP_DESC = " or ".join(str(s) for s in sorted(GESTURE_STEP)) or "any"
 # How often to re-read the headset's true volume while idle. The detector needs
 # a previous value to see a drop, and its own event history drifts: a headset
 # reports one volume when it connects and settles on another a moment later, so
@@ -129,6 +205,11 @@ BT_SETTLE = float(os.environ.get("VOICE_BT_SETTLE", "3.0"))
 BT_AUTOHEAL = os.environ.get("VOICE_BT_AUTOHEAL", "1") not in ("0", "", "no", "off")
 
 STATE = os.path.join(PROJECT, ".state")
+# Where the up-then-down gesture records what it heard. Deliberately NOT under
+# .state: everything there is runtime scratch that no backup covers, and these
+# are hand-made labels that cost a person listening to a song to produce. They
+# sit beside the registry so they travel with the project.
+FLAG_FILE = os.environ.get("VOICE_FLAG_FILE", os.path.join(PROJECT, "censored.tsv"))
 # Spoken the moment your sentence is captured, before the music comes back.
 # Thinking can take half a minute now, and silence for half a minute is
 # indistinguishable from a daemon that has died.
@@ -736,23 +817,52 @@ def load_and_play(paths, index=0):
     # Swap the playlist inside the running mpv rather than restarting it: no
     # audible gap, and the MPRIS registration survives so the headset's own
     # buttons keep working. play.sh's kill-and-relaunch is for a cold start.
+    # TURN MPV'S OWN SHUFFLE OFF FIRST. play.sh starts the player with
+    # --shuffle, which is right for its own job, and mpv keeps applying that
+    # option to EVERY playlist loaded into that process afterwards - including
+    # this one. So the ordering worked out here was being thrown away by the
+    # player it was handed to: on 2026-08-09 "play Hood Rich album" wrote all
+    # sixteen tracks in album order, logged "from #1", and played Greg Street
+    # Countdown, because entry 1 of mpv's reshuffled copy WAS Greg Street
+    # Countdown. Nothing is lost by switching it off, because play_folder
+    # shuffles the paths itself when shuffle is what was asked for; mpv's copy
+    # of the feature was never wanted on this path.
+    mpv("set_property", "options/shuffle", False)
+
     if mpv("loadlist", PLAYLIST_FILE, "replace") is None:
         return start_mpv(index)
-    if index:
-        mpv("set_property", "playlist-pos", index)
+
+    # Set the position every time, index 0 included. "replace" does land on the
+    # first entry today, tested against a scratch player, but that is an
+    # assumption about mpv rather than something this code asks for, and the
+    # difference is one IPC call.
+    mpv("set_property", "playlist-pos", index)
 
     # loadlist replies "success" immediately but loads the file asynchronously,
-    # and initialising the new file can clobber an unpause that landed mid-load.
+    # and initialising the new file can clobber a write that landed mid-load.
     # Seen live on 2026-08-03: the same code left 13 tracks queued at 0:00 while
     # an identical earlier command happened to win the race. So assert, verify,
-    # and re-assert - checking the state beats assuming the write stuck.
+    # and re-assert - checking the state beats assuming the write stuck. Both
+    # writes are in one loop because both lose the same race.
     mpv_set_pause(False)
     for _ in range(10):
         time.sleep(0.15)
-        if not mpv_paused():
+        at, paused = mpv_prop("playlist-pos"), mpv_paused()
+        if at == index and not paused:
             return True
-        mpv_set_pause(False)
-    log("warning: mpv stayed paused after load")
+        if at != index:
+            mpv("set_property", "playlist-pos", index)
+        if paused:
+            mpv_set_pause(False)
+
+    # Two warnings, not one: "it stayed paused" and "it started on the wrong
+    # song" are different faults with different causes, and the second one has
+    # been silent until now. The property name is the one to query by hand.
+    at = mpv_prop("playlist-pos")
+    if at != index:
+        log(f"warning: mpv is on playlist-pos {at} after asking for {index}")
+    if mpv_paused():
+        log("warning: mpv stayed paused after load")
     return True
 
 
@@ -1343,20 +1453,61 @@ def headset_volume():
     return None
 
 
-class Gesture:
-    """Volume down, then back up. See THE GESTURE CLAUSES above for the rules."""
+def handle_flag():
+    """Record the playing track as censored, then skip it. Runs off the D-Bus thread.
 
-    def __init__(self, on_trigger):
-        self.on_trigger = on_trigger
+    Deliberately does NOT delete, and deliberately does not ask. Deleting on a
+    gesture would make a slip of the thumb destroy a file, and the whole point
+    of the flick is that it costs nothing to make at the moment of hearing.
+    What the list is worth is decided later, once it has entries in it.
+
+    Nothing here needs the mic, the model or the network, so it does not take
+    the busy lock: flagging a song while a spoken command is still being
+    answered is a legitimate thing to do, and the two touch nothing in common.
+    """
+    path = mpv_prop("path")
+    if not path:
+        log("flag: nothing is playing, so there is nothing to flag")
+        return
+    rel = os.path.relpath(path, MUSIC) if path.startswith(MUSIC) else path
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        # Append, never rewrite. The file is a log of what a person heard, and
+        # a crash mid-write should cost the current line rather than the lot.
+        with open(FLAG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp}\t{rel}\n")
+    except OSError as exc:
+        # Say so and still skip. A flag that cannot be written is a real
+        # failure, but leaving a censored song playing on top of it helps
+        # nobody, and silence here would read as success.
+        log(f"flag: COULD NOT WRITE {FLAG_FILE}: {exc}")
+    else:
+        log(f"flagged as censored: {rel}")
+    mpv("playlist-next")
+
+
+class Gesture:
+    """One change out, one change back. See THE GESTURE CLAUSES above.
+
+    Direction decides which handler fires: down-then-up talks, up-then-down
+    flags the current track as censored. Every clause is shared, so the two
+    shapes cannot be told apart by anything except the order of the presses,
+    and a slider ramp is refused in both directions by clause 1.
+    """
+
+    def __init__(self, on_trigger, on_flag=None):
+        self.on_trigger = on_trigger          # down then up
+        self.on_flag = on_flag                # up then down
         self.prev = None          # last volume seen
-        self.down_from = None     # value we dropped from, when armed
-        self.down_to = None       # value we dropped to, for the step size
-        self.down_at = 0.0
+        self.arm_from = None      # value the first press moved FROM, when armed
+        self.arm_to = None        # value it moved TO, for the step size
+        self.arm_at = 0.0
+        self.arm_dir = 0          # -1 armed by a press down, +1 by a press up
         self.dragging = False     # a run of changes in one direction
 
     def prime(self, vol):
         """Seed the baseline without counting it as a press."""
-        self.prev, self.down_from, self.dragging = vol, None, False
+        self.prev, self.arm_from, self.dragging = vol, None, False
 
     def armed(self, now=None):
         """Mid-gesture: a drop is waiting for its return. Do not resync now.
@@ -1371,59 +1522,120 @@ class Gesture:
         skips while armed. The one mechanism built to repair a stale baseline
         was disabled by exactly the state it existed to repair.
         """
-        if self.down_from is None:
+        if self.arm_from is None:
             return False
-        return (time.monotonic() if now is None else now) - self.down_at <= GESTURE_WINDOW
+        return (time.monotonic() if now is None else now) - self.arm_at <= GESTURE_WINDOW
 
     def feed(self, vol, now):
         prev, self.prev = self.prev, vol
         if prev is None or vol == prev:
             return
+        direction = -1 if vol < prev else 1
 
-        if vol < prev:                                   # a change DOWNWARD
-            # An arm past the window can never become a gesture - clause 5 would
-            # reject it - so it is not a drag partner either. Discard it instead
-            # of letting it call this press part of a ramp. resync() heals this
-            # too, but only every couple of seconds, and a press can land inside
-            # that gap.
-            if self.down_from is not None and now - self.down_at > GESTURE_WINDOW:
-                log(f"discarded a stale arm ({now - self.down_at:.1f}s old, "
-                    "no matching volume up)")
-                self.down_from, self.dragging = None, False
-            # Already armed means this is the second drop in a row, so whatever
-            # is moving the volume is not a button. Clause 1.
-            self.dragging = self.dragging or self.down_from is not None
-            self.down_from, self.down_to, self.down_at = prev, vol, now
+        # An arm past the window can never become a gesture - clause 5 would
+        # reject it - so it is not a drag partner either. Discard it instead
+        # of letting it call this press part of a ramp. resync() heals this
+        # too, but only every couple of seconds, and a press can land inside
+        # that gap.
+        # ONLY when this press continues in the same direction. A press the
+        # OTHER way is the return leg, however late it is, and it has to reach
+        # the clauses so the log can say "failed maximum gap" rather than
+        # "discarded a stale arm". Both refuse the gesture; only one of them
+        # tells you which clause did it, and that is the whole point of the
+        # rejection log.
+        if (self.arm_from is not None and direction == self.arm_dir
+                and now - self.arm_at > GESTURE_WINDOW):
+            log(f"discarded a stale arm ({now - self.arm_at:.1f}s old, "
+                "no matching volume change back)")
+            self.arm_from, self.dragging = None, False
+
+        if self.arm_from is None or direction == self.arm_dir:
+            # Nothing armed yet, so this press arms. Or: the same direction
+            # twice, which means a run of changes one way, so whatever is
+            # moving the volume is not a button and the pair this eventually
+            # forms will fail clause 1.
+            self.dragging = self.dragging or self.arm_from is not None
+            self.arm_from, self.arm_to = prev, vol
+            self.arm_at, self.arm_dir = now, direction
             return
 
-        start, dragged = self.down_from, self.dragging
-        self.down_from, self.dragging = None, False      # one shot per drop
-        if start is None:
-            return                                       # an UP with no DOWN
+        start, dragged, out = self.arm_from, self.dragging, self.arm_dir
+        self.arm_from, self.dragging = None, False       # one shot per arm
 
-        gap, step = now - self.down_at, start - self.down_to
+        gap = now - self.arm_at
+        # TWO measurements of the same press, and they disagree when the
+        # baseline has drifted. The DROP is measured against a remembered value
+        # that something else may have written; the RISE is measured between two
+        # numbers the headset itself reported, seconds apart. When the step size
+        # is known, the rise is therefore the one to believe. See "the drifted
+        # baseline" in THE GESTURE CLAUSES above.
+        first, back = abs(self.arm_to - start), abs(vol - self.arm_to)
+        press = bool(GESTURE_STEP) and back in GESTURE_STEP
+        step = back if press else first
         clauses = (
-            ("shape (one down, one up)", not dragged),
-            ("symmetry (back to the start)", vol == start),
-            (f"step size (want {GESTURE_STEP})", not GESTURE_STEP or step == GESTURE_STEP),
+            ("shape (one out, one back)", not dragged),
+            ("symmetry (back to the start)", vol == start or press),
+            (f"step size (want {GESTURE_STEP_DESC})", not GESTURE_STEP or step in GESTURE_STEP),
             (f"minimum gap ({GESTURE_MIN}s)", gap >= GESTURE_MIN),
             (f"maximum gap ({GESTURE_WINDOW}s)", gap <= GESTURE_WINDOW),
         )
+        # The absolute volumes, because a step size on its own cannot show a
+        # drifted baseline: every swallowed first press read as an odd step and
+        # the log gave nobody a way to see why. "61 -> 56 -> 64" says it at a
+        # glance, and the arithmetic is then somebody's to check.
+        seen = f"{start} -> {self.arm_to} -> {vol}"
         failed = [name for name, passed in clauses if not passed]
         if failed:
             # Logged, because a rejected pair is exactly what you need to see
             # when tuning the numbers above, and it is rare enough not to spam.
-            log(f"ignored a volume change ({gap:.3f}s, step {step}): "
+            log(f"ignored a volume change ({gap:.3f}s, step {step}, {seen}): "
                 f"failed {failed[0]}")
+            # AND THEN IT ARMS AGAIN, with this very press as the outbound leg.
+            # A press that fails as somebody's return leg is still a perfectly
+            # good FIRST press, and dropping it is what broke the mirrored
+            # gesture within an hour of shipping it (2026-08-14).
+            #
+            # The volume rests wherever the last gesture left it, so a headset
+            # sitting at 40 sends UP(40->48) then DOWN(48->40). That opening UP
+            # arrives while an older DOWN is still armed, gets eaten as its
+            # return leg, fails the window by minutes, and is discarded - so
+            # the gesture that follows can never begin. Every attempt logged
+            # "48 -> 40 -> 48 failed maximum gap" while the headset was plainly
+            # reporting 40 -> 48 -> 40 nine tenths of a second apart.
+            #
+            # This was invisible in the down-up-only design, where discarding a
+            # failed UP cost nothing because only a DOWN could arm.
+            self.arm_from, self.arm_to = prev, vol
+            self.arm_at, self.arm_dir = now, direction
+            self.dragging = False
             return
-        log(f"gesture detected ({gap:.3f}s, step {step})")
-        self.on_trigger()
+        if vol != start:
+            # Fired on the rise despite not landing on the remembered value.
+            # Said out loud rather than absorbed silently: the drift is a real
+            # fault somewhere else, and a growing one should be visible here
+            # before it starts costing gestures again.
+            log(f"baseline had drifted {vol - start:+d} (held {start}, "
+                f"headset says {vol})")
+        if out < 0:
+            log(f"gesture detected ({gap:.3f}s, step {step}, {seen})")
+            self.on_trigger()
+            return
+        # The mirrored shape. Named differently in the log on purpose: the two
+        # gestures do very different things, and a log that calls both of them
+        # the same thing cannot answer "why did it skip that song".
+        log(f"flag gesture detected ({gap:.3f}s, step {step}, {seen})")
+        if self.on_flag is None:
+            log("flag gesture has no handler wired; ignoring")
+            return
+        self.on_flag()
 
 
 def main():
     trigger = (lambda: log("SELFTEST: gesture detected - path works")) if SELFTEST \
         else (lambda: threading.Thread(target=handle_gesture, daemon=True).start())
-    gesture = Gesture(trigger)
+    flag = (lambda: log("SELFTEST: flag gesture detected - path works")) if SELFTEST \
+        else (lambda: threading.Thread(target=handle_flag, daemon=True).start())
+    gesture = Gesture(trigger, flag)
 
     def on_signal(_conn, _sender, path, _iface, _sig, params, *_):
         iface, changed, _invalidated = params.unpack()
@@ -1532,7 +1744,9 @@ def main():
         log(f"SELFTEST: baseline {baseline}; listening for one volume down-up "
             "gesture (Ctrl-C to stop)")
     else:
-        log(f"ready - volume down-up to talk (window {GESTURE_WINDOW}s, model {MODEL})")
+        log(f"ready - volume down-up to talk, up-down to flag a censored song "
+            f"(window {GESTURE_WINDOW}s, step {GESTURE_STEP_DESC}, model {MODEL})")
+        log(f"flags go to {FLAG_FILE}")
         log(f"library: {len(library())} folders, {len(play_targets())} targets, "
             f"tools {TOOLS or 'none'}")
     GLib.MainLoop().run()

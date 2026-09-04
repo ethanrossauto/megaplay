@@ -1,0 +1,26 @@
+# .mirror-allowlist: GENERATED. Do not edit by hand; edit the private .mirror-manifest.
+#
+# The manifest is the one allowlist, and this is its derived form. It is tracked here
+# because a mirror CI checkout never sees the private manifest.
+# Regenerated from that manifest whenever the private side syncs this repo.
+#
+# source: spotify/.mirror-manifest
+# source-sha256-16: ac5fbcd2ef86d289
+#
+# ALLOW = may exist in this repo. DENY = must not, even inside an allowed tree.
+# A path matching no ALLOW line does not belong here at all.
+
+ALLOW ^bin\/
+ALLOW ^CONTRIBUTING\.md$
+ALLOW ^\.github\/
+ALLOW ^\.gitignore$
+ALLOW ^LICENSE$
+ALLOW ^\.mirror-allowlist$
+ALLOW ^playlists\.tsv\.example$
+ALLOW ^README\.md$
+ALLOW ^setup\.sh$
+ALLOW ^tests\/
+
+DENY ^bin\/env\.local\.sh$
+DENY ^bin\/__pycache__\/
+DENY (^|/)(CLAUDE|SESSIONS|SCOPE|STATUS|NOTES|SHOPPING-LIST|DEPLOY|WEATHERPROOFING|HYGIENE|RESTORE)\.md$|(^|/)research/|_build_plan\.md$|(^|/)env\.local\.[a-z]+$

@@ -448,6 +448,13 @@ bin/tag.sh <name>|--all                retag to the scheme above
 bin/dedupe.sh [parent] [--apply]       find and remove cross-folder duplicates
 bin/album-check.sh [scope] [--apply]   collapse album spellings, unify cover art
 bin/explicit.sh <name>|--all [--fix]   find censored tracks, swap in explicit twins
+bin/grab-explicit.sh <name> [--dry-run]  fill gaps, choosing the source: prefers uploads
+                                       labelled explicit or lyric videos, refuses music videos
+bin/verify-explicit.sh <name>|--all    check that songs whose lyrics carry profanity
+                                       actually contain it (lyrics lookup, then transcription)
+bin/verify-length.sh <name>|--all      compare each song's length against the real recording
+bin/swap-track.sh <listfile>           re-source the listed tracks, keeping a new file only
+                                       if it measurably improves on the old one
 bin/sync-phone.sh [--dry-run] [--force-all]   mirror the library to the SD card
 bin/play.sh [name]                     shuffle-play, detached, media keys work
 bin/voice.sh install|start|stop|status|logs|selftest

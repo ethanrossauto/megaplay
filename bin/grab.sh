@@ -161,4 +161,13 @@ case "$name" in */*) "$HERE/dedupe.sh" "${name%%/*}";; esac
 # beats preserving that distinction, so collapse them every time.
 "$HERE/album-check.sh" "${name%%/*}" --apply
 
+# THE EXPLICIT VERIFICATION PASS, on every grab (2026-09-03). New songs are the
+# only way a censored file enters the library, so this is the moment to catch it.
+# Cheap by construction: results are cached per track, so it only ever costs the
+# songs this grab actually added. It reports and never deletes.
+"$HERE/verify-explicit.sh" "$name"
+# And the LENGTH pass: a radio edit or a truncated download is shorter than the
+# real recording, and neither shows up in the tags. Cheap, no decoding.
+"$HERE/verify-length.sh" "$name"
+
 echo "DONE: '$name' now has $(folder_count "$name") songs."
