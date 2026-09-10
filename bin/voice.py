@@ -38,6 +38,12 @@ import time
 
 from gi.repository import Gio, GLib
 
+# The audit log sits beside this file. The directory is put on the path
+# explicitly because this module is also loaded through importlib by the test
+# suite, which does not add it the way running the file as a script does.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import audit                                                    # noqa: E402
+
 HOME = os.path.expanduser("~")
 # Derived from this file's location, not hardcoded, so a clone works anywhere.
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -73,7 +79,8 @@ TOOLS = os.environ.get("VOICE_TOOLS", "WebSearch,WebFetch")
 # TWO GESTURES, SAME FIVE CLAUSES, MIRRORED SHAPES (second one 2026-08-14):
 #
 #   DOWN then UP    talk to it. Pauses, listens, asks, plays.
-#   UP then DOWN    the song you are hearing is CENSORED. Flags it, skips it.
+#   UP then DOWN    something is WRONG with the song you are hearing. Flags
+#                   it with your position in the track, and skips it.
 #
 # The second exists because censorship cannot be detected from metadata and,
 # as it turns out, not from the audio either. Spotify's explicit flag
@@ -106,29 +113,22 @@ TOOLS = os.environ.get("VOICE_TOOLS", "WebSearch,WebFetch")
 #                 does so for free: a ramp in either direction is refused
 #                 before the direction is ever consulted.
 #   2. SYMMETRY   the return lands on the EXACT starting value, OR the way back
-#                 up is one press of a known size (clause 3).
+#                 up is one press of a known size (clause 3), OR the headset has
+#                 not been measured yet and the return leg is button-sized and
+#                 misses by less than its own length.
 #                 The original guard. A real adjustment rarely comes back to
-#                 where it began; a gesture always does. The second half of it
-#                 exists because the starting value is not always trustworthy:
-#                 see "the drifted baseline" below. With no step size pinned
-#                 there is nothing to recognise a press by, so the exact return
-#                 is all there is and this clause stays as strict as it was.
-#   3. STEP       the press is one of GESTURE_STEP. 0 accepts any size.
-#                 MEASURED ON THE WAY BACK UP where that lands on a known size,
-#                 and only otherwise on the way down. Both numbers in the rise
-#                 came from the headset; the drop is measured against a value
-#                 the headset may never have agreed with.
+#                 where it began; a gesture always does. The two escapes both
+#                 exist because the starting value is not always trustworthy:
+#                 see "the drifted baseline" below. A button moves the volume
+#                 along the HEADSET'S own grid, so a real gesture cannot land
+#                 anywhere but where it started - if the return misses, the miss
+#                 is an error in the value this machine remembered rather than
+#                 something the person did.
+#   3. STEP       the press is one of the sizes THIS headset produces, and the
+#                 daemon works those out for itself. See MEASURING THE STEP.
 #                 A button moves the volume by a fixed amount, so a different
-#                 amount is something other than a button. That amount is not
-#                 always ONE number, which is why this takes a comma-separated
-#                 list: the volume range is 0 to 127, that does not divide
-#                 evenly by the number of steps a headset has, and so most
-#                 presses move by N while a few land on N-1. Pinning a single
-#                 value kills the gesture at whichever volume sits on the odd
-#                 step and nowhere else, which reads as random flakiness rather
-#                 than as a setting. (2026-08-06: pinned to 8, dead at the one
-#                 volume where the drop measured 7.) Every accepted gesture
-#                 logs its step, so read yours off the log before pinning it.
+#                 amount is something other than a button - the desktop slider,
+#                 another application, a drift correction.
 #   4. MIN GAP    at least GESTURE_MIN between the two presses.
 #                 Deliberate gestures measured 0.978s to 1.234s over six
 #                 tries. A slider ramp is far faster.
@@ -139,6 +139,49 @@ TOOLS = os.environ.get("VOICE_TOOLS", "WebSearch,WebFetch")
 #
 # A pair that arms and then fails logs WHICH clause rejected it, so tuning
 # these is a matter of reading the log rather than guessing.
+#
+# MEASURING THE STEP - clause 3 configures itself, per headset (2026-09-09).
+#
+# 🔴 THE NUMBER IN CLAUSE 3 IS A PROPERTY OF THE HEADSET, AND IT USED TO BE A
+# CONSTANT FOR THE WHOLE PROCESS. So it had to be pinned by hand, to one
+# headset, and plugging in a different one broke the gesture with no clue
+# beyond a line in a log nobody was reading. Measured: one headset presses in
+# steps of 7 or 8, another in steps of 4, and the second one silently did
+# nothing for weeks while every other clause passed.
+#
+# 🔑 ONE PRESS IS ENOUGH, BUT ONLY TO LOCATE THE SIZE, NOT TO PIN IT. A headset
+# has N steps over a range of 0 to 127, and 127 divides evenly by nothing, so
+# its presses come out as two adjacent sizes - mostly one, occasionally the
+# other. A measurement therefore has to accept a neighbourhood: the size seen
+# and one either side. See steps_for(), which says what the first version of
+# this got wrong and why a sharper answer was worse than a blunt one.
+#
+# WHERE THE MEASUREMENT IS TAKEN, and it is the whole safety argument: only
+# from a pair that has already satisfied the OTHER FOUR clauses. A single
+# volume change on its own could be anything. One that is part of a symmetric,
+# correctly-timed, one-out-one-back pair is a gesture, and the only thing that
+# makes that shape is a person pressing a button twice.
+#
+# 🔒 THE FIRST GESTURE ON A HEADSET NOBODY HAS MEASURED WORKS, AND THAT TOOK A
+# SECOND FIX. Clause 3 passing while unmeasured is not enough on its own,
+# because clause 2 was then the strict one and a brand new headset is exactly
+# the case whose baseline is wrong: PipeWire writes an off-grid volume ON
+# CONNECT. So the first press on a new headset was spent correcting the baseline
+# and the second one was the one that worked - buy a headset, press the button,
+# nothing happens. Clause 2 now forgives a miss while a headset is unmeasured,
+# under the bounds in feed(), and the measurement is taken from the return leg
+# so the drift is not written into it. Learning only ever ADDS a guard; it can
+# never be what stops a gesture firing.
+#
+# 🔁 AND IT CORRECTS ITSELF. A measurement is the one thing here that can be
+# wrong about the DEVICE rather than about the gesture - taken from the wrong
+# headset it refuses every real press forever, which is the failure this whole
+# section exists to end. So GESTURE_RELEARN pairs in a row that fail on the
+# step size AND NOTHING ELSE are taken as proof the number is wrong, and the
+# size is measured again from the pair in hand.
+#
+# Sizes are kept in GESTURE_STEP_FILE, by bluetooth address, so swapping
+# between headsets costs nothing after the first gesture on each.
 #
 # THE DRIFTED BASELINE - "the first gesture never works", part 4 (2026-08-09).
 # The headset's volume and the number this machine holds for it are two
@@ -162,6 +205,23 @@ TOOLS = os.environ.get("VOICE_TOOLS", "WebSearch,WebFetch")
 # ===========================================================================
 GESTURE_MIN = float(os.environ.get("VOICE_GESTURE_MIN", "0.6"))
 GESTURE_WINDOW = float(os.environ.get("VOICE_GESTURE_WINDOW", "2.0"))
+# The AVRCP volume range every bluetooth headset is addressed through. A
+# headset's own step grid is this range divided by however many steps it has,
+# which is the fact the whole of clause 3 now rests on.
+BT_VOLUME_MAX = 127
+# How many step-size refusals in a row mean the SIZE is wrong rather than the
+# gesture. Three, because a headset producing both sizes of its own grid is
+# already covered by steps_for(), so three in a row is a different device or a
+# bad measurement rather than the ordinary odd step.
+GESTURE_RELEARN = int(os.environ.get("VOICE_GESTURE_RELEARN", "3"))
+# 🔑 THE SMALLEST MOVE A HEADSET BUTTON MAKES, and the largest. One definition,
+# used twice: it decides what may be measured as a step, and it decides whether
+# a return leg is button-sized enough to be believed over a stale baseline.
+# Below 3 a change is indistinguishable from a desktop slider notch; above 32
+# there would be fewer than four steps on the whole range, which no headset has.
+MIN_BUTTON_STEP, MAX_BUTTON_STEP = 3, 32
+
+
 def parse_steps(spec):
     """Clause 3's knob: a comma-separated list of accepted drop sizes.
 
@@ -177,8 +237,59 @@ def parse_steps(spec):
     return frozenset() if 0 in got else got
 
 
-GESTURE_STEP = parse_steps(os.environ.get("VOICE_GESTURE_STEP", "0"))
-GESTURE_STEP_DESC = " or ".join(str(s) for s in sorted(GESTURE_STEP)) or "any"
+def step_desc(steps):
+    """Clause 3's setting, in the words the log and the ready line use."""
+    return " or ".join(str(s) for s in sorted(steps)) or "any"
+
+
+def steps_for(press):
+    """Every step size a headset that just moved by `press` can produce.
+
+    A HEADSET DOES NOT HAVE ONE STEP SIZE. It has N volume steps spread over a
+    range of 0 to 127, and 127 divides evenly by nothing, so its presses come
+    out as two adjacent sizes: mostly one, occasionally the other. Pinned by
+    hand to whichever size somebody happened to observe, the gesture dies at the
+    volumes that sit on the other one and nowhere else, which reads as flaky
+    hardware rather than as a setting. That cost days on one headset in
+    2026-08, where the press is 8 almost everywhere and 7 around volume 71.
+
+    🔴 SO THE ANSWER IS A NEIGHBOURHOOD, NOT A GRID, AND THE FIRST VERSION OF
+    THIS GOT THAT WRONG. It recovered N as round(127/press) and returned that
+    grid exactly, which is a precise answer computed from an imprecise
+    measurement: at the small end round(127/press) swings wildly, so a 4-step
+    press claims a 32-step headset and a 5-step press claims a 25-step one.
+    Measured on a real WH-1000XM5 inside one minute, presses of 4 AND 5 from the
+    same headset seconds apart, so it is neither - it is about 30, and a single
+    sample cannot tell you that. Locking in either grid excludes the other real
+    size, and then clause 3 refuses half the presses and the relearn below flips
+    the measurement back and forth forever.
+
+    ⚠️ AN EMPTY RESULT MEANS "DO NOT LEARN FROM THIS", NOT "ANY SIZE". Below 3
+    the press is indistinguishable from a desktop slider notch, and learning it
+    would hand clause 3 a set that accepts exactly what the clause exists to
+    refuse. Above 32 there would be fewer than four steps on the whole range,
+    which no headset has. A device outside that band stays unlearned and keeps
+    the strict clauses, which is a working gesture with one guard fewer.
+    """
+    if not MIN_BUTTON_STEP <= press <= MAX_BUTTON_STEP:
+        return frozenset()
+    # One either side, because a single measurement is uncertain by about that
+    # much: the headset's own two sizes are adjacent, and the remembered
+    # baseline can sit a unit off the headset's grid (see "the drifted
+    # baseline"). Both perturb one sample by one, and neither is worth trying
+    # to distinguish from the other.
+    return frozenset(n for n in (press - 1, press, press + 1)
+                     if n >= MIN_BUTTON_STEP)
+
+
+# 🔑 "auto" IS THE DEFAULT, AND IT IS WHAT MAKES THIS WORK ON A HEADSET NOBODY
+# HAS MEASURED. The size is learned per device from the first gesture that
+# satisfies the other four clauses, then kept. The two explicit settings remain:
+# a list pins it and never learns, and 0 turns clause 3 off entirely.
+_STEP_SPEC = os.environ.get("VOICE_GESTURE_STEP", "auto").strip()
+GESTURE_LEARN = _STEP_SPEC.lower() in ("", "auto")
+GESTURE_STEP = frozenset() if GESTURE_LEARN else parse_steps(_STEP_SPEC)
+GESTURE_STEP_DESC = "learned per device" if GESTURE_LEARN else step_desc(GESTURE_STEP)
 # How often to re-read the headset's true volume while idle. The detector needs
 # a previous value to see a drop, and its own event history drifts: a headset
 # reports one volume when it connects and settles on another a moment later, so
@@ -209,7 +320,12 @@ STATE = os.path.join(PROJECT, ".state")
 # .state: everything there is runtime scratch that no backup covers, and these
 # are hand-made labels that cost a person listening to a song to produce. They
 # sit beside the registry so they travel with the project.
-FLAG_FILE = os.environ.get("VOICE_FLAG_FILE", os.path.join(PROJECT, "censored.tsv"))
+FLAG_FILE = os.environ.get("VOICE_FLAG_FILE", os.path.join(PROJECT, "flagged.tsv"))
+# What each headset's volume step was measured to be, by bluetooth address.
+# Runtime scratch on purpose: it is a measurement of the hardware plugged into
+# THIS machine, it costs one gesture to rebuild, and a headset that has never
+# been seen here has nothing to restore anyway.
+GESTURE_STEP_FILE = os.path.join(STATE, "gesture-steps.json")
 # Spoken the moment your sentence is captured, before the music comes back.
 # Thinking can take half a minute now, and silence for half a minute is
 # indistinguishable from a daemon that has died.
@@ -245,6 +361,12 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# A log that cannot be written has to be visible in the place everything else
+# about this daemon is visible, or the failure is indistinguishable from a quiet
+# evening with nothing to record.
+audit.report = lambda msg: log(f"audit: {msg}")
+
+
 def log_wrapped(label, text):
     """Log a paragraph under a label, wrapped with a hanging indent.
 
@@ -260,6 +382,18 @@ def log_wrapped(label, text):
     log(f"{label}: {lines[0]}")
     for line in lines[1:]:
         print(f"{indent}{line}", flush=True)
+
+
+def reasoning(cmd):
+    """The model's own account of the choice, whichever field it used.
+
+    One reading of it rather than the same fallback chain written twice: it is
+    printed for a person and stored as the audit row's detail, and those two must
+    not drift into disagreeing about what the model said.
+    """
+    c = cmd or {}
+    return (c.get("why") or c.get("note") or c.get("reason")
+            or "(the model gave no reasoning)")
 
 
 def describe(cmd):
@@ -354,9 +488,24 @@ def resume_music():
     Worth checking here specifically: switching the headset's profile takes the
     sink out from under whatever is playing, and a player that did not survive
     that would otherwise look exactly like a command that decided to stay quiet.
+
+    ⚠️ VERIFIED AND RETRIED, NOT FIRED ONCE. The profile round trip destroys and
+    rebuilds the sink, which corks whatever is playing - and the switch BACK is a
+    SECOND destroy, so an unpause can be undone a moment after it lands and the
+    music simply stays off with nothing reporting a failure. Checking beats
+    guessing how long the rebuild takes, which is a number nobody here has
+    measured. The dictation daemon sharing this headset learned the same thing
+    independently.
     """
-    if not mpv_ok(mpv("set_property", "pause", False)):
-        log("mpv is not responding after the capture - bin/play.sh restarts it")
+    for attempt in range(3):
+        if not mpv_ok(mpv("set_property", "pause", False)):
+            log("mpv is not responding after the capture - bin/play.sh restarts it")
+            return
+        time.sleep(0.4)
+        if mpv_prop("pause") is not True:
+            return
+        log(f"the sink rebuild corked the music again; unpausing "
+            f"(attempt {attempt + 2})")
 
 
 def mpv_set_pause(state):
@@ -714,12 +863,29 @@ def start_index(count, start):
     return 0
 
 
-def ask_claude(utterance):
+def ask_claude(utterance, command_id=None):
     """Send the transcript to Claude Code in print mode. Returns a dict or None.
 
     Uses `claude -p`, which authenticates with the logged-in subscription - no
     API key, no per-command billing.
+
+    THE DECISION ROW IS WRITTEN HERE, which is the one place that knows all of
+    it: the model, the sentence, how long it took, and either the command it
+    produced with the reasoning behind it or the specific way it failed. It lands
+    BEFORE the caller executes anything, so a crash between deciding and playing
+    still leaves the intent on record.
     """
+    started = time.monotonic()
+
+    def failed(detail):
+        """Record a turn the model did not complete, and return no command."""
+        audit.log_event(
+            tool="dispatch", source="voice", tier="llm", result="error",
+            command_id=command_id, detail=detail,
+            params={"model": MODEL, "effort": EFFORT, "utterance": utterance},
+            latency_ms=int((time.monotonic() - started) * 1000))
+        return None
+
     prompt = (SYSTEM_PROMPT
               .replace("{NOW}", now_playing())
               .replace("{LIBRARY}", "\n".join(annotated_targets()))
@@ -742,14 +908,15 @@ def ask_claude(utterance):
         # Do NOT repr the exception: it carries the whole command, and the
         # prompt now contains the 743-track catalogue (~60KB of log per failure).
         log(f"claude timed out after {CLAUDE_TIMEOUT}s")
-        return None
+        return failed(f"the model did not answer within {CLAUDE_TIMEOUT}s")
     except OSError as exc:
         log(f"could not run claude: {exc.__class__.__name__}: {exc}")
-        return None
+        return failed(f"could not run claude: {exc.__class__.__name__}: {exc}")
 
     if proc.returncode != 0:
         log(f"claude exited {proc.returncode}: {proc.stderr.strip()[:200]}")
-        return None
+        return failed(f"claude exited {proc.returncode}: "
+                      f"{proc.stderr.strip()[:200]}")
 
     # Claude Code wraps the answer in an envelope; the model's text is .result
     try:
@@ -764,12 +931,23 @@ def ask_claude(utterance):
     start, end = raw.find("{"), raw.rfind("}")
     if start < 0 or end <= start:
         log(f"no JSON in reply: {raw[:200]!r}")
-        return None
+        return failed(f"the reply carried no command: {raw[:200]!r}")
     try:
-        return json.loads(raw[start:end + 1])
+        cmd = json.loads(raw[start:end + 1])
     except ValueError:
         log(f"unparseable JSON: {raw[start:end + 1][:200]!r}")
-        return None
+        return failed(f"the reply would not parse: {raw[start:end + 1][:200]!r}")
+
+    # The reasoning is the part of a turn that cannot be reconstructed later. The
+    # command can be inferred from what the music did; why this one was chosen
+    # over the others exists only here.
+    audit.log_event(
+        tool="dispatch", source="voice", tier="llm", result="ok",
+        command_id=command_id, detail=reasoning(cmd),
+        params={"model": MODEL, "effort": EFFORT, "utterance": utterance,
+                "command": cmd},
+        latency_ms=int((time.monotonic() - started) * 1000))
+    return cmd
 
 
 def start_mpv(index):
@@ -866,9 +1044,27 @@ def load_and_play(paths, index=0):
     return True
 
 
-def execute(cmd):
-    """Run one parsed command. Returns True if it set playback state itself."""
+def execute(cmd, command_id=None):
+    """Run one parsed command. Returns True if it set playback state itself.
+
+    THIS IS THE ONLY PLACE A MODEL DECISION BECOMES PLAYBACK, and it writes an
+    audit row at every one of its exits, the refusals included. That is what
+    makes "every action is on the record" a property of where the code sits
+    rather than a promise, and the way to break it is to add a second route from
+    a decision to the player.
+
+    REFUSED AND BROKEN ARE LOGGED AS DIFFERENT THINGS. A folder that is not on
+    disk or a track number outside the catalogue is the system working correctly
+    and declining, so it is `rejected`. A player that will not answer is
+    `error`. Collapsing them would make it impossible to ask afterwards how often
+    the model asks for something impossible, which is the question that says
+    whether the prompt is working.
+    """
     action = (cmd or {}).get("action")
+
+    def emit(tool, result, detail, params=None):
+        audit.log_event(tool=tool, source="voice", tier="llm", result=result,
+                        command_id=command_id, params=params, detail=detail)
 
     # Transport commands need a live mpv. Check the reply instead of assuming:
     # a dead socket used to return "handled" and do nothing, so "skip this"
@@ -876,23 +1072,41 @@ def execute(cmd):
     if action in ("next", "prev"):
         if not mpv_ok(mpv("playlist-next" if action == "next" else "playlist-prev")):
             log(f"{action}: mpv is not responding - is anything playing?")
+            emit(action, "error", "the player did not answer, so nothing moved")
             return False
         mpv_set_pause(False)
+        emit(action, "ok", f"stepped to the {action} track")
         return True
     if action in ("pause", "resume"):
         if not mpv_ok(mpv("set_property", "pause", action == "pause")):
             log(f"{action}: mpv is not responding - is anything playing?")
+            emit(action, "error", "the player did not answer, so nothing changed")
             return False
+        emit(action, "ok", f"playback {action}d")
         return True
     if action == "play":
         target = cmd.get("target", "")
+        order, start = cmd.get("order", "default"), cmd.get("start", "beginning")
+        params = {"target": target, "order": order, "start": start}
         # Re-check against disk: the model was told to copy exactly, but a
         # hallucinated path must not reach the filesystem on its word alone.
         if target not in play_targets():
             log(f"refusing unknown folder: {target!r}")
+            emit("play", "rejected",
+                 f"there is no folder called {target!r} in the library", params)
             return False
-        return play_folder(target, cmd.get("order", "default"),
-                           cmd.get("start", "beginning"))
+        if play_folder(target, order, start):
+            emit("play", "ok", f"started {target}", params)
+            return True
+        # play_folder returns False for two reasons and they are different facts
+        # about what went wrong. Asking the folder settles it, and this only runs
+        # on a path that has already failed.
+        empty = not tracks_in(target)
+        emit("play", "rejected" if empty else "error",
+             f"{target} holds no playable files" if empty
+             else "the playlist could not be written, so nothing reached the player",
+             params)
+        return False
     if action == "play_tracks":
         rows = catalog()
         paths, bad = [], []
@@ -907,16 +1121,35 @@ def execute(cmd):
                 bad.append(n)
         if bad:
             log(f"ignoring out-of-range track numbers: {bad}")
+        # The dropped numbers travel on the row whether or not the turn survived
+        # them: a command that played 53 of the 55 tracks it asked for looks like
+        # a success everywhere except here.
+        params = {"asked": len(cmd.get("tracks") or []), "played": len(paths),
+                  "out_of_range": bad}
         if not paths:
             log("selection contained no valid tracks")
+            emit("play_tracks", "rejected",
+                 "none of the track numbers were in the catalogue", params)
             return False
         log(f"queued {len(paths)} tracks")
-        return load_and_play(paths, 0)
+        if load_and_play(paths, 0):
+            emit("play_tracks", "ok", f"queued {len(paths)} tracks", params)
+            return True
+        emit("play_tracks", "error",
+             "the playlist could not be written, so nothing reached the player",
+             params)
+        return False
     if action == "none":
         log("no action taken")           # the reasoning is logged by the caller
+        # Logged as a refusal because nothing happened, and carrying the model's
+        # own reason: this daemon is built to pick rather than decline, so a turn
+        # that ends in nothing is close to a bug and the row is where that shows.
+        emit("none", "rejected", f"the model took no action: {reasoning(cmd)}")
         return False
 
     log(f"unrecognised action: {cmd!r}")
+    emit("unknown", "error", f"the model answered with an action this daemon "
+                             f"does not have: {cmd!r}"[:400])
     return False
 
 
@@ -1031,6 +1264,14 @@ def heal_stuck_profile():
     reconnecting the device renegotiated it.
     """
     global _healed_at
+    # ⛔ NOT OURS TO HEAL WHEN IT IS NOT OURS TO SWITCH. With VOICE_BT off the
+    # session manager owns the profile and moves it to a call profile on purpose
+    # whenever any capture opens the default source - this daemon's own, and the
+    # dictation daemon sharing the same headset. Forcing it back on a timer
+    # would cut somebody off mid-sentence, and the twenty-second watchdog is
+    # exactly the wrong thing to arm against a profile somebody else is using.
+    if not BT_ON:
+        return False
     card = bt_card()
     if not card or card.get("current") == BT_A2DP:
         return False                      # no headset, or nothing wrong here
@@ -1360,12 +1601,20 @@ def listen(source=None):
 busy = threading.Lock()
 
 
-def handle_gesture():
-    """Pause, listen, dispatch, restore. Runs off the D-Bus thread."""
+def handle_gesture(addr=None):
+    """Pause, listen, dispatch, restore. Runs off the D-Bus thread.
+
+    `addr` is the headset that gestured, so the volume it was at can be put back
+    afterwards and the detector told the daemon was the one that moved it.
+    """
     if not busy.acquire(blocking=False):
         log("already handling a command; ignoring trigger")
         return
     try:
+        # One id for one flick of the thumb. Everything this turn produces hangs
+        # off it, so the log reads as one interaction rather than three rows that
+        # happen to be next to each other.
+        command_id = audit.new_command_id()
         was_paused = mpv_paused()
         mpv_set_pause(True)                    # duck out of the way of the mic
 
@@ -1374,19 +1623,45 @@ def handle_gesture():
         # narrow while nothing is playing through it. give_mic_back runs from a
         # finally, because a headset left in a call profile is a headset that
         # sounds broken for the rest of the evening.
+        started = time.monotonic()
+        # Read BEFORE anything touches the profile: this is the number the
+        # listener chose, and the whole point is to hand it back.
+        found = headsets().get(addr) if addr else None
+        was_at = found[0] if found else None
         card, source = take_mic()
         try:
             log("listening...")
             text = listen(source)
         finally:
             give_mic_back(card)
+        heard_ms = int((time.monotonic() - started) * 1000)
+        # ⚠️ ON ITS OWN THREAD, because it has to wait for the transport to come
+        # back and the rest of this turn must not. The music resumes a few lines
+        # below and the model is already thinking; blocking here would put a
+        # couple of seconds of silence exactly where the silence used to be.
+        if was_at is not None:
+            threading.Thread(target=restore_volume, args=(addr, was_at),
+                             daemon=True).start()
 
         if not text:
             log("heard nothing")
+            # A turn that ended at the microphone is still a turn. Without this
+            # row a gesture that caught nothing is invisible, and "the gesture
+            # did not fire" and "it fired and heard silence" are the two things
+            # anybody debugging this needs to tell apart.
+            audit.log_event(
+                tool="listen", source="voice", result="rejected",
+                command_id=command_id, latency_ms=heard_ms,
+                detail="the capture produced no words, so the turn ended here")
             if not was_paused:
                 resume_music()
             return
         log(f"heard: {text!r}")
+        # tier is null: the capture is a local model on this machine and costs no
+        # dispatch. That is what makes the tier column answer how often the
+        # expensive half actually ran.
+        audit.log_event(tool="listen", source="voice", result="ok",
+                        command_id=command_id, latency_ms=heard_ms, detail=text)
 
         # Think and talk at the same time. The dispatch call goes out FIRST, on
         # its own thread, and the spoken line plays over the top of it while the
@@ -1395,7 +1670,8 @@ def handle_gesture():
         # saying "one moment" before the moment had started.
         thinking = {}
         thinker = threading.Thread(
-            target=lambda: thinking.update(cmd=ask_claude(text)), daemon=True)
+            target=lambda: thinking.update(cmd=ask_claude(text, command_id)),
+            daemon=True)
         thinker.start()
 
         play_ack()
@@ -1415,10 +1691,10 @@ def handle_gesture():
         # Every turn ends with the model's own account of the choice. It is told
         # to pick rather than ask when a request is ambiguous, so the reasoning
         # behind a pick made on your behalf has to be readable afterwards, not
-        # inferred from what came out of the speakers.
-        log_wrapped("why", cmd.get("why") or cmd.get("note") or cmd.get("reason")
-                    or "(the model gave no reasoning)")
-        execute(cmd)
+        # inferred from what came out of the speakers. ask_claude has already put
+        # this same sentence on the record; this is the copy you hear about now.
+        log_wrapped("why", reasoning(cmd))
+        execute(cmd, command_id)
     finally:
         busy.release()
 
@@ -1427,16 +1703,47 @@ def handle_gesture():
 # Gesture detection
 # --------------------------------------------------------------------------
 
-def headset_volume():
-    """The headset's current AVRCP volume from BlueZ, or None if none is connected.
+# The live router, so a turn can tell the detector when the DAEMON moved the
+# volume rather than a person. Set once, by main().
+ROUTER = None
 
-    Read at startup to seed the baseline. Without it the FIRST gesture after a
+
+def device_of(path):
+    """The bluetooth address out of a BlueZ object path, or None.
+
+    A transport path is `/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep3/fd0`. The
+    `sep` and `fd` parts are torn down and rebuilt on every reconnect, and the
+    `dev` part is the headset itself, which is why the address is what state
+    gets filed under and why the subscription cannot just pin a path.
+
+    ⚠️ SCANNED FOR RATHER THAN INDEXED. The depth is not fixed: the same headset
+    reports `.../dev_X/fd0` on one stack and `.../dev_X/sep3/fd0` on this one,
+    so counting slashes works until it silently does not.
+    """
+    for part in str(path).split("/"):
+        if part.startswith("dev_"):
+            return part[4:].replace("_", ":")
+    return None
+
+
+def headsets():
+    """Every connected transport as `{address: (volume, name)}`.
+
+    Read at startup to seed the baselines. Without it the FIRST gesture after a
     restart was always swallowed: feed() needs a previous value to see a drop,
     the first volume event is what supplies it, and so the opening DOWN press
     was spent establishing the baseline instead of arming the gesture. The
     following UP then found nothing armed. Every later gesture worked, which is
     what made it look intermittent rather than structural.
+
+    🔑 A DICT RATHER THAN ONE NUMBER. This used to return the volume of
+    whichever transport BlueZ happened to list first, which is fine with one
+    headset connected and wrong with two: the number could belong to the one
+    sitting on the desk rather than the one being worn, and there was no way to
+    tell from the answer. The name rides along because it is what the log calls
+    the device, and an address is not something anybody recognises.
     """
+    volumes, names = {}, {}
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         reply = bus.call_sync("org.bluez", "/",
@@ -1444,58 +1751,233 @@ def headset_volume():
                               "GetManagedObjects", None,
                               GLib.VariantType("(a{oa{sa{sv}}})"),
                               Gio.DBusCallFlags.NONE, 2000, None)
-        for _path, ifaces in reply.unpack()[0].items():
+        for path, ifaces in reply.unpack()[0].items():
+            addr = device_of(path)
+            if addr is None:
+                continue
             props = ifaces.get("org.bluez.MediaTransport1") or {}
             if "Volume" in props:
-                return int(props["Volume"])
+                volumes[addr] = int(props["Volume"])
+            alias = (ifaces.get("org.bluez.Device1") or {}).get("Alias")
+            if alias:
+                names[addr] = str(alias)
     except (GLib.Error, ValueError, TypeError):
-        return None
-    return None
+        return {}
+    return {a: (v, names.get(a, a)) for a, v in volumes.items()}
 
 
-def handle_flag():
-    """Record the playing track as censored, then skip it. Runs off the D-Bus thread.
+# How long to let the rebuilt transport settle before believing what it reports.
+# Picked, not measured, and checked rather than trusted: restore_volume() reads
+# again after writing, so a wrong guess costs another pass instead of a wrong
+# volume.
+VOLUME_SETTLE = float(os.environ.get("VOICE_VOLUME_SETTLE", "0.8"))
 
-    Deliberately does NOT delete, and deliberately does not ask. Deleting on a
-    gesture would make a slip of the thumb destroy a file, and the whole point
-    of the flick is that it costs nothing to make at the moment of hearing.
-    What the list is worth is decided later, once it has entries in it.
+
+def set_headset_volume(addr, vol):
+    """Write one headset's AVRCP volume. True if BlueZ took it."""
+    want = max(0, min(BT_VOLUME_MAX, int(vol)))
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        reply = bus.call_sync("org.bluez", "/",
+                              "org.freedesktop.DBus.ObjectManager",
+                              "GetManagedObjects", None,
+                              GLib.VariantType("(a{oa{sa{sv}}})"),
+                              Gio.DBusCallFlags.NONE, 2000, None)
+        for path, ifaces in reply.unpack()[0].items():
+            if (device_of(path) != addr
+                    or "org.bluez.MediaTransport1" not in ifaces):
+                continue
+            bus.call_sync(
+                "org.bluez", path, "org.freedesktop.DBus.Properties", "Set",
+                GLib.Variant("(ssv)", ("org.bluez.MediaTransport1", "Volume",
+                                       GLib.Variant("q", want))),
+                None, Gio.DBusCallFlags.NONE, 2000, None)
+            return True
+    except (GLib.Error, ValueError, TypeError) as exc:
+        log(f"could not set the headset volume: {exc}")
+    return False
+
+
+def restore_volume(addr, want):
+    """Put the volume back where it was before a capture. Runs off the turn.
+
+    🔴 A VOICE COMMAND MUST NOT CHANGE HOW LOUD THE MUSIC IS. Capturing takes
+    the headset through a profile round trip, and the volume that comes back is
+    not always the one that went in: measured here on 2026-09-09, one headset
+    returns exactly ONE STEP LOW every time, so a run of commands walks the
+    music quieter with nothing on screen to explain it. Three commands, three
+    drops: 64 to 59, 42 to 38, 38 to 34.
+
+    🔑 IT DOES NOT CARE WHO SWITCHED THE PROFILE, and that is deliberate. The
+    daemon used to do it itself; WirePlumber does it now, when a capture opens
+    the default source. Written against the OUTCOME rather than the mechanism,
+    this keeps working either way, and it is a no-op on a headset that already
+    comes back where it started.
+
+    ⚠️ CHECKED, NOT TIMED. The value can be written again while the sink
+    finishes rebuilding, so this reads back after writing rather than trusting
+    one guess at how long that takes.
+    """
+    for _ in range(3):
+        time.sleep(VOLUME_SETTLE)
+        found = headsets().get(addr)
+        if found is None:
+            continue                       # mid-switch: no transport to read
+        current = found[0]
+        if current == want:
+            break
+        if not set_headset_volume(addr, want):
+            break
+        log(f"volume put back {current} -> {want} after the capture")
+
+    # 🔑 AND THE DETECTOR IS TOLD. Everything above was the DAEMON moving the
+    # volume, not a person pressing a button. Left in the detector's history the
+    # round trip arms a phantom press, and the next real gesture is spent
+    # discarding it - which is exactly the "discarded a stale arm" line that
+    # appeared after every command.
+    found = headsets().get(addr)
+    if ROUTER is not None and found is not None:
+        ROUTER.detector(addr).prime(found[0])
+
+
+def load_learned_steps():
+    """What each headset's step size was last measured to be. Never raises.
+
+    A missing or unreadable file reads as "nothing learned yet", which costs one
+    gesture per device to rebuild and is the correct answer either way: a grid
+    that cannot be trusted must not be used, because a wrong one refuses every
+    real press.
+    """
+    try:
+        with open(GESTURE_STEP_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(saved, dict):
+        return {}
+    out = {}
+    for addr, sizes in saved.items():
+        # Shape-checked rather than trusted. This file is rewritten by a daemon
+        # that can be killed mid-write, and a half-parsed grid is worse than
+        # none: it would silently reject every press from that headset.
+        if isinstance(sizes, list) and sizes and all(
+                isinstance(n, int) and 0 < n <= BT_VOLUME_MAX for n in sizes):
+            out[str(addr)] = frozenset(sizes)
+    return out
+
+
+def save_learned_steps(known):
+    """Write the measured grids back, atomically, and never take the daemon down.
+
+    Replaced rather than written in place: this is read at startup, and a
+    truncated file there would cost every headset its measurement at once.
+    """
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = f"{GESTURE_STEP_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({a: sorted(v) for a, v in known.items()},
+                      fh, indent=1, sort_keys=True)
+        os.replace(tmp, GESTURE_STEP_FILE)
+    except OSError as exc:
+        # Loud, not fatal. The gesture still works this session; it just has to
+        # measure again next time, and silence here would make that look like
+        # the learning never happened.
+        log(f"could not save the learned step sizes: {exc}")
+
+
+def handle_flag(addr=None):
+    """Record that the playing track has a PROBLEM, then skip it.
+
+    Takes `addr` for symmetry with handle_gesture and uses it for nothing: this
+    path opens no microphone, so there is no profile round trip and no volume to
+    put back.
+
+    Runs off the D-Bus thread. Deliberately does NOT delete, and deliberately
+    does not ask. Deleting on a gesture would make a slip of the thumb destroy
+    a file, and the whole point of the flick is that it costs nothing to make
+    at the moment of hearing. What the list is worth is decided later.
+
+    ⚠️ ANY problem, not only censorship (2026-09-05). The faults that actually
+    turn up are a mixed bag and a listener cannot be asked to classify them
+    mid-song: a censored cut, a track that stops dead partway through and jumps
+    to the next one, a pitch-shifted upload that sounds like chipmunks, a live
+    take where the album version was wanted. One gesture, one bit of
+    information: SOMETHING IS WRONG WITH THIS ONE.
+
+    🔑 THE POSITION IS RECORDED, and it is what makes the bit useful. A flag at
+    1:45 of a file whose own header says 1:47 is a track that stopped early; a
+    flag ten seconds in is a wrong version noticed immediately. The two need
+    completely different repairs, and the timestamp separates them without
+    asking the listener anything.
 
     Nothing here needs the mic, the model or the network, so it does not take
     the busy lock: flagging a song while a spoken command is still being
-    answered is a legitimate thing to do, and the two touch nothing in common.
+    answered is legitimate, and the two touch nothing in common.
     """
+    command_id = audit.new_command_id()
     path = mpv_prop("path")
     if not path:
         log("flag: nothing is playing, so there is nothing to flag")
+        audit.log_event(tool="flag", source="gesture", result="rejected",
+                        command_id=command_id,
+                        detail="the gesture fired with nothing playing")
         return
     rel = os.path.relpath(path, MUSIC) if path.startswith(MUSIC) else path
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Where in the track, and how long the file claims to be. Both are read
+    # from the player rather than the file, so a missing value is written as
+    # "?" instead of a zero that would read as "flagged at the very start".
+    pos = mpv_prop("time-pos")
+    dur = mpv_prop("duration")
+    pos_s = f"{pos:.0f}" if isinstance(pos, (int, float)) else "?"
+    dur_s = f"{dur:.0f}" if isinstance(dur, (int, float)) else "?"
+    marks = {"position_s": pos_s, "duration_s": dur_s}
     try:
         # Append, never rewrite. The file is a log of what a person heard, and
         # a crash mid-write should cost the current line rather than the lot.
         with open(FLAG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(f"{stamp}\t{rel}\n")
+            fh.write(f"{stamp}\t{pos_s}\t{dur_s}\t{rel}\n")
     except OSError as exc:
         # Say so and still skip. A flag that cannot be written is a real
-        # failure, but leaving a censored song playing on top of it helps
-        # nobody, and silence here would read as success.
+        # failure, but leaving a bad song playing on top of it helps nobody,
+        # and silence here would read as success.
         log(f"flag: COULD NOT WRITE {FLAG_FILE}: {exc}")
+        audit.log_event(tool="flag", source="gesture", result="error",
+                        command_id=command_id, track_path=rel, params=marks,
+                        detail=f"the label could not be written: {exc}")
     else:
-        log(f"flagged as censored: {rel}")
-    mpv("playlist-next")
+        log(f"flagged as faulty at {pos_s}s of {dur_s}s: {rel}")
+        # tier is null and the source is the gesture, not the voice: this whole
+        # path costs no model call, which is why it can be made at the moment of
+        # hearing without waiting for anything.
+        audit.log_event(tool="flag", source="gesture", result="ok",
+                        command_id=command_id, track_path=rel, params=marks,
+                        detail=f"flagged as faulty at {pos_s}s of {dur_s}s")
+
+    # The skip is a second effect on playback and gets its own row, because the
+    # question this log has to answer about any given moment is why the music did
+    # what it did, and "a flag was written" does not explain a track change.
+    skipped = mpv_ok(mpv("playlist-next"))
+    audit.log_event(tool="next", source="gesture",
+                    result="ok" if skipped else "error",
+                    command_id=command_id, track_path=rel,
+                    detail="skipped the flagged track" if skipped else
+                           "the player did not answer, so the flagged track may "
+                           "still be playing")
 
 
 class Gesture:
     """One change out, one change back. See THE GESTURE CLAUSES above.
 
     Direction decides which handler fires: down-then-up talks, up-then-down
-    flags the current track as censored. Every clause is shared, so the two
+    flags the current track as faulty. Every clause is shared, so the two
     shapes cannot be told apart by anything except the order of the presses,
     and a slider ramp is refused in both directions by clause 1.
     """
 
-    def __init__(self, on_trigger, on_flag=None):
+    def __init__(self, on_trigger, on_flag=None, steps=None, learn=None,
+                 on_learn=None, label=""):
         self.on_trigger = on_trigger          # down then up
         self.on_flag = on_flag                # up then down
         self.prev = None          # last volume seen
@@ -1504,6 +1986,43 @@ class Gesture:
         self.arm_at = 0.0
         self.arm_dir = 0          # -1 armed by a press down, +1 by a press up
         self.dragging = False     # a run of changes in one direction
+        # 🔑 CLAUSE 3 LIVES ON THE DETECTOR, NOT ON THE PROCESS, because it
+        # describes the HEADSET and two of them can be connected at once. As a
+        # module-wide constant it was a number that had to be true of every
+        # device anybody owned, which is why it had to be pinned by hand and why
+        # pinning it for one headset broke the other.
+        self.steps = GESTURE_STEP if steps is None else frozenset(steps)
+        self.learn = GESTURE_LEARN if learn is None else learn
+        self.on_learn = on_learn  # told when the measurement changes
+        self.label = label        # which headset, for the log
+        self.blind = 0            # step-size refusals in a row
+
+    def say(self, msg):
+        """Log, naming the headset when there is more than one that could talk."""
+        log(f"{self.label}: {msg}" if self.label else msg)
+
+    def adopt(self, press):
+        """Take a press size as this headset's grid, and remember it.
+
+        Refuses sizes no button produces rather than believing them: a grid
+        learned from a slider notch would accept exactly what clause 3 exists to
+        refuse, and one learned from a drift correction would refuse every real
+        press. Staying unlearned costs one guard and keeps the gesture working,
+        which is the better of the two failures.
+        """
+        learned = steps_for(press)
+        if not learned:
+            self.say(f"a {press}-step change is outside the range a headset "
+                     "button uses, so the step size stays unmeasured")
+            self.blind = 0
+            return False
+        was, self.steps, self.blind = self.steps, learned, 0
+        if learned != was:
+            self.say(f"measured the volume step from a {press}-step press: "
+                     f"accepting {step_desc(learned)}")
+            if self.on_learn:
+                self.on_learn(learned)
+        return True
 
     def prime(self, vol):
         """Seed the baseline without counting it as a press."""
@@ -1545,8 +2064,8 @@ class Gesture:
         # rejection log.
         if (self.arm_from is not None and direction == self.arm_dir
                 and now - self.arm_at > GESTURE_WINDOW):
-            log(f"discarded a stale arm ({now - self.arm_at:.1f}s old, "
-                "no matching volume change back)")
+            self.say(f"discarded a stale arm ({now - self.arm_at:.1f}s old, "
+                     "no matching volume change back)")
             self.arm_from, self.dragging = None, False
 
         if self.arm_from is None or direction == self.arm_dir:
@@ -1570,12 +2089,47 @@ class Gesture:
         # is known, the rise is therefore the one to believe. See "the drifted
         # baseline" in THE GESTURE CLAUSES above.
         first, back = abs(self.arm_to - start), abs(vol - self.arm_to)
-        press = bool(GESTURE_STEP) and back in GESTURE_STEP
-        step = back if press else first
+        press = bool(self.steps) and back in self.steps
+
+        # 🔴 THE CHICKEN AND EGG THIS CLOSES. Clause 2 forgives a drifted
+        # baseline only when clause 3 can recognise a press, clause 3 can only
+        # do that once the headset has been measured, and the measurement only
+        # ever comes from a gesture that got past clause 2. A headset nobody has
+        # measured is exactly the one whose baseline is most likely to be wrong,
+        # because PipeWire writes an off-grid volume ON CONNECT - so the first
+        # gesture on a brand new headset was the one case that could not work,
+        # and it took a throwaway press to correct the baseline before the real
+        # one landed.
+        #
+        # 🔑 WHY IT IS SAFE TO FORGIVE. A headset button moves the volume down
+        # and back up along the headset's OWN grid, so a real gesture cannot
+        # land anywhere except where it started. If the return misses, the miss
+        # is by definition an error in the value THIS MACHINE remembered, never
+        # something the person did. All that is left to establish is whether the
+        # two events were button presses at all, and the return leg answers
+        # that: it is button-sized, and it is smaller than nothing a slider
+        # produces.
+        #
+        # ⚠️ BOUNDED THREE WAYS so it cannot become a general relaxation. It
+        # applies only while the headset is unmeasured, so at most one gesture
+        # per device ever; only when the daemon is going to measure, so an
+        # explicit VOICE_GESTURE_STEP=0 does not get it forever; and only when
+        # the miss is SMALLER than the press, because a drift is a fraction of a
+        # step and anything larger is a different action.
+        settling = (self.learn and not self.steps
+                    and back >= MIN_BUTTON_STEP
+                    and abs(vol - start) < back)
+
+        # ⚠️ AND THE RETURN LEG IS WHAT GETS MEASURED. The drop was measured
+        # against the value that is wrong; the rise is measured between two
+        # numbers the headset itself reported, seconds apart. Believing the drop
+        # here would write the drift into the measurement permanently.
+        step = back if (press or settling) else first
+        step_name = f"step size (want {step_desc(self.steps)})"
         clauses = (
             ("shape (one out, one back)", not dragged),
-            ("symmetry (back to the start)", vol == start or press),
-            (f"step size (want {GESTURE_STEP_DESC})", not GESTURE_STEP or step in GESTURE_STEP),
+            ("symmetry (back to the start)", vol == start or press or settling),
+            (step_name, not self.steps or step in self.steps),
             (f"minimum gap ({GESTURE_MIN}s)", gap >= GESTURE_MIN),
             (f"maximum gap ({GESTURE_WINDOW}s)", gap <= GESTURE_WINDOW),
         )
@@ -1585,11 +2139,29 @@ class Gesture:
         # glance, and the arithmetic is then somebody's to check.
         seen = f"{start} -> {self.arm_to} -> {vol}"
         failed = [name for name, passed in clauses if not passed]
+
+        # 🔴 THE STEP SIZE IS THE ONLY CLAUSE THAT CAN BE WRONG ABOUT THE HEADSET
+        # RATHER THAN ABOUT THE GESTURE, so it is the only one evidence is
+        # allowed to overrule. The other four describe the shape of something a
+        # person did; this one repeats a measurement, and a measurement taken
+        # from a different headset refuses every real press until somebody
+        # notices and edits a file. Three refusals that fail on NOTHING else
+        # means the number is wrong rather than the presses, which is exactly
+        # the state a swapped headset lands in.
+        if failed == [step_name] and self.learn:
+            self.blind += 1
+            if self.blind >= GESTURE_RELEARN and steps_for(step):
+                self.say(f"the step size has been wrong {self.blind} times "
+                         f"running (wanted {step_desc(self.steps)}, saw {step}), "
+                         "so it was measured from the wrong headset")
+                self.adopt(step)
+                failed = []
+
         if failed:
             # Logged, because a rejected pair is exactly what you need to see
             # when tuning the numbers above, and it is rare enough not to spam.
-            log(f"ignored a volume change ({gap:.3f}s, step {step}, {seen}): "
-                f"failed {failed[0]}")
+            self.say(f"ignored a volume change ({gap:.3f}s, step {step}, {seen}): "
+                     f"failed {failed[0]}")
             # AND THEN IT ARMS AGAIN, with this very press as the outbound leg.
             # A press that fails as somebody's return leg is still a perfectly
             # good FIRST press, and dropping it is what broke the mirrored
@@ -1609,54 +2181,154 @@ class Gesture:
             self.arm_at, self.arm_dir = now, direction
             self.dragging = False
             return
+
+        # 🔑 THE MEASUREMENT IS TAKEN HERE, from a pair that has just satisfied
+        # every other clause, and nowhere else. That is the only moment this
+        # daemon can be certain a BUTTON is what moved the volume: a single
+        # change on its own could be the desktop slider, a drift correction, or
+        # another application. Clause 2 was strict to reach this line, so the
+        # drop and the rise agree and there is no question which to believe.
+        if self.learn and not self.steps:
+            self.adopt(step)
+        self.blind = 0
+
         if vol != start:
             # Fired on the rise despite not landing on the remembered value.
             # Said out loud rather than absorbed silently: the drift is a real
             # fault somewhere else, and a growing one should be visible here
             # before it starts costing gestures again.
-            log(f"baseline had drifted {vol - start:+d} (held {start}, "
-                f"headset says {vol})")
+            self.say(f"baseline had drifted {vol - start:+d} (held {start}, "
+                     f"headset says {vol})")
         if out < 0:
-            log(f"gesture detected ({gap:.3f}s, step {step}, {seen})")
+            self.say(f"gesture detected ({gap:.3f}s, step {step}, {seen})")
             self.on_trigger()
             return
         # The mirrored shape. Named differently in the log on purpose: the two
         # gestures do very different things, and a log that calls both of them
         # the same thing cannot answer "why did it skip that song".
-        log(f"flag gesture detected ({gap:.3f}s, step {step}, {seen})")
+        self.say(f"flag gesture detected ({gap:.3f}s, step {step}, {seen})")
         if self.on_flag is None:
-            log("flag gesture has no handler wired; ignoring")
+            self.say("flag gesture has no handler wired; ignoring")
             return
         self.on_flag()
 
 
+class GestureRouter:
+    """One detector per headset, chosen by the address in the transport path.
+
+    🔑 EVERY FIELD IN A Gesture IS ABOUT ONE HEADSET - the last volume seen, the
+    press waiting for its return, the measured step - and there used to be a
+    single one of them for the whole daemon. With two headsets connected their
+    volume events interleaved into that one state machine: a press on the one
+    being worn arrived as the return leg of something the other had done, so
+    neither could complete a gesture and the log blamed clause 1. Filing the
+    state under the address it arrived from is what makes "any device" cover any
+    NUMBER of them as well as any model.
+
+    The MEASUREMENT outlives the state on purpose. A headset that disconnects
+    loses its baseline, because the volume it comes back at is not the one it
+    left at; it does not lose its step size, because that is a property of the
+    hardware and does not change while it is in the drawer.
+    """
+
+    def __init__(self, on_trigger, on_flag):
+        self.on_trigger, self.on_flag = on_trigger, on_flag
+        self.known = load_learned_steps()
+        self.names = {}
+        self.by_addr = {}
+
+    def detector(self, addr):
+        """The detector for one headset, created the first time it is seen."""
+        found = self.by_addr.get(addr)
+        if found is not None:
+            return found
+        # ⚠️ A PIN BEATS A MEASUREMENT. Anyone who set VOICE_GESTURE_STEP by hand
+        # has overruled this, and quietly loading a stored grid over the top
+        # would make their setting look broken in a way nothing would explain.
+        steps = self.known.get(addr) if GESTURE_LEARN else GESTURE_STEP
+        # ⚠️ THE ADDRESS IS CLOSED OVER RATHER THAN PASSED THROUGH Gesture. The
+        # detector's job is to recognise a shape, not to know which headset it
+        # is on, so its callbacks stay zero-argument and the router is what
+        # remembers who fired.
+        found = Gesture(lambda a=addr: self.on_trigger(a),
+                        lambda a=addr: self.on_flag(a), steps=steps,
+                        on_learn=lambda sizes, a=addr: self.remember(a, sizes),
+                        label=self.names.get(addr, addr))
+        self.by_addr[addr] = found
+        found.say("volume step " + (
+            f"{step_desc(steps)}, " + ("measured on an earlier run"
+                                       if GESTURE_LEARN else "pinned by hand")
+            if steps else "not measured yet; the first gesture will set it"))
+        return found
+
+    def remember(self, addr, steps):
+        self.known[addr] = steps
+        save_learned_steps(self.known)
+
+    def rename(self, addr, name):
+        """Use the headset's own name in the log once BlueZ has supplied it.
+
+        An address is not something anybody recognises, and this daemon now has
+        to say WHICH headset a line is about.
+        """
+        if name and self.names.get(addr) != name:
+            self.names[addr] = name
+            if addr in self.by_addr:
+                self.by_addr[addr].label = name
+
+    def feed(self, path, vol, now):
+        # A path with no device in it is not a headset, so there is nothing to
+        # file this under and nothing that could have gestured.
+        addr = device_of(path)
+        if addr is not None:
+            self.detector(addr).feed(vol, now)
+
+    def forget(self, addr):
+        self.by_addr.pop(addr, None)
+
+    def deaf(self):
+        """True when nothing connected has a baseline. See watchdog()."""
+        return not any(g.prev is not None for g in self.by_addr.values())
+
+
 def main():
-    trigger = (lambda: log("SELFTEST: gesture detected - path works")) if SELFTEST \
-        else (lambda: threading.Thread(target=handle_gesture, daemon=True).start())
-    flag = (lambda: log("SELFTEST: flag gesture detected - path works")) if SELFTEST \
-        else (lambda: threading.Thread(target=handle_flag, daemon=True).start())
-    gesture = Gesture(trigger, flag)
+    global ROUTER
+    trigger = (lambda _a: log("SELFTEST: gesture detected - path works")) if SELFTEST \
+        else (lambda a: threading.Thread(target=handle_gesture, args=(a,),
+                                         daemon=True).start())
+    flag = (lambda _a: log("SELFTEST: flag gesture detected - path works")) if SELFTEST \
+        else (lambda a: threading.Thread(target=handle_flag, args=(a,),
+                                         daemon=True).start())
+    router = ROUTER = GestureRouter(trigger, flag)
 
     def on_signal(_conn, _sender, path, _iface, _sig, params, *_):
         iface, changed, _invalidated = params.unpack()
         if iface != "org.bluez.MediaTransport1" or "Volume" not in changed:
             return
-        gesture.feed(int(changed["Volume"]), time.monotonic())
+        router.feed(path, int(changed["Volume"]), time.monotonic())
 
     def on_added(_conn, _sender, _path, _iface, _sig, params, *_):
         """A headset that just connected brings its own volume with it."""
-        _obj, ifaces = params.unpack()
+        obj, ifaces = params.unpack()
+        addr = device_of(obj)
+        if addr is None:
+            return
+        router.rename(addr, (ifaces.get("org.bluez.Device1") or {}).get("Alias"))
         props = ifaces.get("org.bluez.MediaTransport1") or {}
         if "Volume" in props:
-            gesture.prime(int(props["Volume"]))
-            log(f"headset connected, volume baseline {props['Volume']}")
+            detector = router.detector(addr)
+            detector.prime(int(props["Volume"]))
+            detector.say(f"connected, volume baseline {props['Volume']}")
 
     def on_removed(_conn, _sender, _path, _iface, _sig, params, *_):
-        """A headset that left takes its baseline with it."""
-        _obj, ifaces = params.unpack()
-        if "org.bluez.MediaTransport1" in ifaces:
-            gesture.prime(None)
-            log("headset gone, baseline cleared")
+        """A headset that left takes its baseline with it, but not its step."""
+        obj, ifaces = params.unpack()
+        addr = device_of(obj)
+        if addr is None or "org.bluez.MediaTransport1" not in ifaces:
+            return
+        if addr in router.by_addr:
+            router.by_addr[addr].say("gone, baseline cleared")
+        router.forget(addr)
 
     def resync():
         """Keep the baseline honest between gestures.
@@ -1671,12 +2343,18 @@ def main():
         Skipped while a drop is waiting for its return, and while a command is
         already running, so this can never rewrite state mid-gesture.
         """
-        if not gesture.armed() and not busy.locked():
-            current = headset_volume()
-            if current is not None and current != gesture.prev:
-                if gesture.prev is not None:
-                    log(f"volume baseline corrected {gesture.prev} -> {current}")
-                gesture.prime(current)
+        if busy.locked():
+            return True
+        for addr, (current, name) in headsets().items():
+            router.rename(addr, name)
+            detector = router.detector(addr)
+            # Skipped per headset rather than for the daemon as a whole: one
+            # headset mid-gesture is no reason to let another one's baseline rot.
+            if detector.armed() or current == detector.prev:
+                continue
+            if detector.prev is not None:
+                detector.say(f"volume baseline corrected {detector.prev} -> {current}")
+            detector.prime(current)
         return True                                   # keep the timer alive
 
     GLib.timeout_add_seconds(max(1, int(GESTURE_RESYNC)), resync)
@@ -1693,7 +2371,7 @@ def main():
         Cheap because it only looks when the baseline is missing, which is also
         the only time anything could be wrong.
         """
-        if gesture.prev is None and not busy.locked():
+        if router.deaf() and not busy.locked():
             heal_stuck_profile()
         # Cheap no-op unless the bank is short or the persona file changed, so
         # an edit to the seed takes effect within one tick rather than waiting
@@ -1731,24 +2409,38 @@ def main():
     if BT_ON:
         heal_stuck_profile()
 
-    baseline = headset_volume()
-    if baseline is None:
+    found = headsets()
+    if not found:
         log("no headset volume yet - the baseline is set when one connects")
-    else:
-        gesture.prime(baseline)
+    for addr, (vol, name) in found.items():
+        router.rename(addr, name)
+        router.detector(addr).prime(vol)
         # Said out loud, because a silent success and a silent failure look the
         # same in a log, and this one decides whether the first gesture works.
-        log(f"volume baseline {baseline}, first gesture is armed")
+        log(f"volume baseline {vol} for {name}, first gesture is armed")
+    baseline = {name: vol for (vol, name) in found.values()}
 
     if SELFTEST:
         log(f"SELFTEST: baseline {baseline}; listening for one volume down-up "
             "gesture (Ctrl-C to stop)")
     else:
-        log(f"ready - volume down-up to talk, up-down to flag a censored song "
+        log(f"ready - volume down-up to talk, up-down to flag a faulty track "
             f"(window {GESTURE_WINDOW}s, step {GESTURE_STEP_DESC}, model {MODEL})")
         log(f"flags go to {FLAG_FILE}")
-        log(f"library: {len(library())} folders, {len(play_targets())} targets, "
+        folders, targets = len(library()), len(play_targets())
+        log(f"library: {folders} folders, {targets} targets, "
             f"tools {TOOLS or 'none'}")
+        # A row with no command id of its own, and it is the one that explains a
+        # gap: an audit log with nothing in it for two days means either a quiet
+        # two days or a daemon that was not running, and only this tells them
+        # apart. Deliberately not written under --selftest, which handles no real
+        # commands and would otherwise put rows in the record for a dry run.
+        audit.log_event(
+            tool="daemon_start", source="system", result="ok",
+            params={"model": MODEL, "effort": EFFORT, "tools": TOOLS,
+                    "folders": folders, "targets": targets,
+                    "volume_baseline": baseline},
+            detail="the daemon came up and armed the gesture")
     GLib.MainLoop().run()
 
 

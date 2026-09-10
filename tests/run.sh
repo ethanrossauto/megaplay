@@ -597,6 +597,35 @@ t8_playback() {
 }
 
 # ---------------------------------------------------------------------------
+# T9  the audit log
+#
+# Two halves in one file. The first needs nothing at all: it drives bin/audit.py and checks
+# that the table refuses a vocabulary it does not know, that a write it cannot make is
+# reported rather than swallowed, and that rows group under the command that caused them.
+# The second imports voice.py, so it needs python3-gi, and it is the half worth having: it
+# runs execute() through every exit it has and asserts each one left a row. A branch added
+# later that acts on the player and forgets to log fails here.
+#
+# The log is a throwaway file in a temp directory. It never opens the real one.
+# ---------------------------------------------------------------------------
+t9_audit() {
+  group "T9  the audit log"
+  local out
+  if out="$(python3 "$ROOT/tests/audit_test.py" 2>&1)"; then
+    printf '%s\n' "$out" | sed 's/^/  /'
+    PASS=$((PASS+1))
+  else
+    bad "the audit log" "$out"
+    return
+  fi
+  # The file reports its own skip, and it is repeated here so it reaches the summary. A gap
+  # that scrolls past is how "all green" comes to mean "I could not look".
+  python3 -c 'import gi' >/dev/null 2>&1 || \
+    skip "execute() writes a row at every exit" \
+         "no python3-gi, which voice.py imports at module level"
+}
+
+# ---------------------------------------------------------------------------
 
 WANTED=("$@")
 printf '%stest suite%s  (%s, %s side)\n' "$B" "$N" "$ROOT" "$SIDE"
@@ -609,6 +638,7 @@ want_group T5 && t5_gesture
 want_group T6 && t6_docs
 want_group T7 && t7_library
 want_group T8 && t8_playback
+want_group T9 && t9_audit
 
 printf '\n%s----- summary -----%s\n' "$B" "$N"
 printf '  %s%s passed%s, %s%s failed%s, %s%s skipped%s\n' \

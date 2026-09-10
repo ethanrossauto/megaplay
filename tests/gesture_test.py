@@ -17,6 +17,7 @@ GLib main loop and waits for a real headset, so on a build machine it would hang
 import importlib.util
 import os
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -158,11 +159,11 @@ LIST_CASES = [
     ("a drifted baseline survives on the seven-step size too",
      "7,8", [(41, 0.0), (48, 1.0)], 44, 1, "gesture detected"),
 
-    # THE DEGRADATION, stated as a test because it is a real limit and not an oversight: with no
-    # step size pinned there is nothing to tell a press from a drift, so clause 2 stays strict
-    # and the drifted pair is refused exactly as it was before. The shipped default is 0, so
-    # this is the behaviour anyone gets until they read their own step off the log.
-    ("with no step pinned a drifted baseline is still refused",
+    # ⚠️ THIS IS THE EXPLICIT OFF SWITCH, NOT THE DEFAULT. VOICE_GESTURE_STEP=0 turns clause 3
+    # off for good, so no measurement is ever coming and the forgiveness below would be
+    # permanent rather than once per headset. Clause 2 therefore stays strict here, which is
+    # what this case pins. The shipped default is "auto", covered further down.
+    ("with clause 3 switched off entirely, a drifted baseline is still refused",
      "0", [(40, 0.0), (48, 1.0)], 45, 0, "symmetry"),
 ]
 
@@ -255,6 +256,237 @@ for name, events, start, want_log in FLAG_CASES:
     else:
         print(f"PASS  {name}")
 
+# ---------------------------------------------------------------------------
+# MEASURING THE STEP - clause 3 configuring itself, per headset
+#
+# The clause used to be a constant somebody had to read off a log and pin by hand, so it
+# described ONE headset and quietly refused every press from any other. These check the three
+# things that has to be true for it to configure itself safely: that one press is enough to
+# derive the whole grid, that the first gesture on an unmeasured headset still fires, and that
+# a wrong measurement corrects itself instead of bricking the gesture forever.
+# ---------------------------------------------------------------------------
+
+# 127 divides evenly by nothing, so a headset's presses come out as two adjacent sizes and a
+# measurement has to accept a neighbourhood. ⚠️ THE FIRST VERSION OF THIS RETURNED A GRID
+# computed as round(127/press), which is a precise answer from an imprecise sample: see the
+# oscillation case below, which is the real headset that disproved it within a minute.
+STEP_MATH = [
+    ("an 8-step press accepts 7 through 9", 8, {7, 8, 9}),
+    ("a 7-step press accepts 6 through 8, so both of that headset's sizes pass", 7, {6, 7, 8}),
+    ("a 4-step press accepts 3 through 5", 4, {3, 4, 5}),
+    ("a 16-step press accepts 15 through 17", 16, {15, 16, 17}),
+    # Nothing below 3 survives, so a measurement can never widen down onto slider territory.
+    ("a 3-step press does not widen down onto a slider notch", 3, {3, 4}),
+    # Refusing to learn is not a failure to learn. A slider notch would hand clause 3 a set
+    # that accepts exactly what the clause exists to refuse, so it is left unmeasured instead.
+    ("a 1-step change is a slider, not a button, and teaches nothing", 1, set()),
+    ("nor is a 2-step change, which would accept a slider too", 2, set()),
+    ("and nothing above 32, which would be fewer than four steps in the range", 40, set()),
+]
+for name, press, want in STEP_MATH:
+    got = set(voice.steps_for(press))
+    if got != want:
+        failures.append(f"{name}: steps_for({press}) gave {sorted(got)}, wanted {sorted(want)}")
+    else:
+        print(f"PASS  {name}")
+
+# The address is what everything is filed under, and the depth of the path is not fixed: the
+# same headset reports .../dev_X/fd0 on one stack and .../dev_X/sep3/fd0 here.
+# 🔒 THE ADDRESSES ARE FROM RFC 7042's DOCUMENTATION RANGE (00-00-5E-00-53-xx), NOT REAL ONES.
+# This file publishes, and a bluetooth MAC is a persistent identifier for a device somebody
+# wears in public. A test about PARSING a path needs a well-formed address, never a real one.
+PATHS = [
+    ("an address is read out of a transport path",
+     "/org/bluez/hci0/dev_00_00_5E_00_53_01/sep3/fd0", "00:00:5E:00:53:01"),
+    ("and out of a shallower one",
+     "/org/bluez/hci0/dev_00_00_5E_00_53_02/fd0", "00:00:5E:00:53:02"),
+    ("a path with no device in it is not a headset",
+     "/org/bluez/hci0", None),
+]
+for name, path, want in PATHS:
+    got = voice.device_of(path)
+    if got != want:
+        failures.append(f"{name}: device_of gave {got!r}, wanted {want!r}")
+    else:
+        print(f"PASS  {name}")
+
+
+def run_learning(events, start=48, steps=frozenset(), learn=True):
+    """A detector that measures its own step, the way the daemon builds one."""
+    LOG.clear()
+    fired = {"voice": 0, "flag": 0}
+
+    def bump(kind):
+        def fire():
+            fired[kind] += 1
+        return fire
+
+    g = voice.Gesture(bump("voice"), bump("flag"), steps=steps, learn=learn)
+    g.prime(start)
+    for vol, at in events:
+        g.feed(vol, at)
+    return g, fired["voice"], list(LOG)
+
+
+# 🔒 THE HEADSET NOBODY HAS MEASURED STILL WORKS. This is the property that makes learning
+# safe to switch on by default: it can only ever ADD a guard, never be the reason a gesture
+# fails. A 4-step press is the one that was silently dead before this existed.
+g, fires, lines = run_learning([(64, 0.0), (68, 1.0)], start=68)
+if fires != 1:
+    failures.append(f"first gesture on an unmeasured headset: fired {fires}, wanted 1. "
+                    f"log: {' | '.join(lines)}")
+elif set(g.steps) != {3, 4, 5}:
+    failures.append(f"after learning: steps are {sorted(g.steps)}, wanted [3, 4, 5]")
+else:
+    print("PASS  the first gesture on an unmeasured headset fires, and measures it")
+
+# 🔴 THE REGRESSION THAT MATTERS, and it came off a real headset rather than out of a
+# thought experiment. A WH-1000XM5 pressed 68 -> 64 and then 64 -> 59 inside one minute:
+# four AND five, from the same headset, seconds apart. A measurement that pinned the grid
+# from either sample excluded the other size, so clause 3 refused half the presses and the
+# relearn below flipped the answer back and forth forever. Whichever size arrives first,
+# both have to pass.
+for seen, other in ((4, 5), (5, 4)):
+    learned = voice.steps_for(seen)
+    if not {seen, other} <= set(learned):
+        failures.append(f"a {seen}-step press learned {sorted(learned)}, which excludes the "
+                        f"same headset's {other}-step press")
+        break
+else:
+    print("PASS  a headset that presses 4 and 5 has both accepted, whichever arrives first")
+
+# And having measured it, the clause is live: the other headset's press is now refused, which
+# is the guard that was lost while the shipped default accepted any size at all.
+_g, fires, lines = run_learning([(61, 0.0), (68, 1.0)], start=68, steps=frozenset({3, 4, 5}))
+if fires != 0 or "step size (want 3 or 4 or 5)" not in " | ".join(lines):
+    failures.append(f"a measured headset should refuse a 7-step press: fired {fires}. "
+                    f"log: {' | '.join(lines)}")
+else:
+    print("PASS  once measured, a press from a different headset is refused")
+
+# 🔑 THE DEGRADATION THE OLD DEFAULT CARRIED, GONE. With no step pinned, clause 2 had to stay
+# strict, so a drifted baseline was refused and the first gesture after a profile switch was
+# spent correcting it. Measuring the step is what lets the rise be believed instead.
+_g, fires, lines = run_learning([(60, 0.0), (68, 1.0)], start=64, steps=frozenset({7, 8}))
+if fires != 1:
+    failures.append(f"a drifted baseline should survive once the step is known: "
+                    f"fired {fires}. log: {' | '.join(lines)}")
+elif "baseline had drifted" not in " | ".join(lines):
+    failures.append("the drift should be said out loud, not absorbed silently")
+else:
+    print("PASS  a measured step rescues a drifted baseline, which pinning by hand also did")
+
+# 🔴 THE FIRST GESTURE ON A BRAND NEW HEADSET, WITH THE BASELINE ALREADY WRONG. This is the
+# case the whole thing turns on: PipeWire writes an off-grid volume ON CONNECT, so a headset
+# nobody has measured is exactly the one whose baseline is least trustworthy, and clause 2
+# had nothing to lean on because clause 3 needs a measurement that needs a gesture that needs
+# clause 2. Buying a headset and having the first press do nothing is the symptom.
+g, fires, lines = run_learning([(59, 0.0), (63, 1.0)], start=64)
+joined = " | ".join(lines)
+if fires != 1:
+    failures.append(f"a new headset with a drifted baseline should still fire: "
+                    f"fired {fires}. log: {joined}")
+# 🔑 AND IT MUST MEASURE FROM THE RETURN LEG, NOT THE DROP. The drop was measured against the
+# value that is wrong (64 -> 59 reads as 5); the rise is between two numbers the headset
+# itself reported (59 -> 63, the true 4). Believing the drop would write the drift into the
+# measurement permanently, and every later press would be judged against it.
+elif set(g.steps) != {3, 4, 5}:
+    failures.append(f"measured {sorted(g.steps)} from a drifted first gesture, wanted [3, 4, 5] "
+                    f"- the drop says 5 and only the return leg says the true 4")
+elif "baseline had drifted" not in joined:
+    failures.append(f"the drift should be said out loud, not absorbed silently. log: {joined}")
+else:
+    print("PASS  a new headset fires on a drifted first gesture, and measures the return leg")
+
+# ⚠️ AND THE FORGIVENESS IS BOUNDED, or it stops being about drift. A return leg the size of a
+# slider notch is not a button, and a miss bigger than the press itself is a different action
+# rather than a stale baseline.
+for name, events, start in (
+        ("a slider notch is not forgiven, however close it lands", [(63, 0.0), (62, 1.0)], 64),
+        ("nor is a miss bigger than the press itself", [(59, 0.0), (54, 1.0)], 64)):
+    g, fires, lines = run_learning(events, start)
+    if fires != 0:
+        failures.append(f"{name}: fired {fires}, wanted 0. log: {' | '.join(lines)}")
+    elif g.steps:
+        failures.append(f"{name}: measured {sorted(g.steps)} off a pair it should have refused")
+    else:
+        print(f"PASS  {name}")
+
+# 🔁 A MEASUREMENT TAKEN FROM THE WRONG HEADSET CORRECTS ITSELF. Without this, swapping
+# headsets would replace "pinned wrong by hand" with "measured wrong automatically", which is
+# the same dead gesture with a longer story behind it.
+events, t = [], 0.0
+for _ in range(3):                       # three 4-step gestures at a 7/8 measurement
+    events += [(64, t), (68, t + 1.0)]
+    t += 4.0
+g, fires, lines = run_learning(events, start=68, steps=frozenset({7, 8}))
+joined = " | ".join(lines)
+if fires != 1:
+    failures.append(f"the third refusal should relearn and fire: fired {fires}. log: {joined}")
+elif set(g.steps) != {3, 4, 5}:
+    failures.append(f"after relearning: steps are {sorted(g.steps)}, wanted [3, 4, 5]")
+elif "measured from the wrong headset" not in joined:
+    failures.append(f"relearning should say why, out loud. log: {joined}")
+else:
+    print("PASS  three step-size refusals in a row remeasure, rather than staying wrong")
+
+# ⛔ AND A PIN IS NOT OVERRULED. Someone who set the value by hand has decided; correcting it
+# from under them would make their setting look broken with nothing to explain it.
+g, fires, _lines = run_learning(events, start=68, steps=frozenset({7, 8}), learn=False)
+if fires != 0 or set(g.steps) != {7, 8}:
+    failures.append(f"a pinned step must not relearn: fired {fires}, steps {sorted(g.steps)}")
+else:
+    print("PASS  a step pinned by hand is never remeasured")
+
+# ---------------------------------------------------------------------------
+# Two headsets at once, which is the other half of "any device"
+# ---------------------------------------------------------------------------
+voice.GESTURE_LEARN = True
+voice.GESTURE_STEP = frozenset()
+voice.GESTURE_STEP_FILE = os.path.join(
+    tempfile.mkdtemp(prefix="gesture-steps-"), "gesture-steps.json")
+
+XM, Q45 = "/org/bluez/hci0/dev_AA_AA_AA_AA_AA_AA/sep3/fd0", "/org/bluez/hci0/dev_BB_BB_BB_BB_BB_BB/fd0"
+LOG.clear()
+fired = []
+router = voice.GestureRouter(lambda a: fired.append(("voice", a)),
+                             lambda a: fired.append(("flag", a)))
+router.feed(XM, 68, 0.0)
+router.feed(Q45, 48, 0.0)
+
+# 🔴 THE INTERLEAVING BUG. One headset's press used to arrive as the return leg of the other's,
+# because all of this state lived on a single detector for the whole daemon. Here the second
+# headset changes volume in the MIDDLE of the first one's gesture, and the gesture still lands.
+router.feed(XM, 64, 1.0)                 # the press down
+router.feed(Q45, 40, 1.2)                # the other headset, mid-gesture
+router.feed(XM, 68, 2.0)                 # the press back up, completing it
+if fired != [("voice", "AA:AA:AA:AA:AA:AA")]:
+    failures.append(f"two headsets at once: fired {fired}, wanted one voice trigger "
+                    f"naming the headset that made it. "
+                    f"log: {' | '.join(LOG)}")
+else:
+    print("PASS  a second headset moving mid-gesture does not eat the first one's press")
+
+# Each keeps its own measurement, which is what makes swapping between them free.
+if set(router.by_addr["AA:AA:AA:AA:AA:AA"].steps) != {3, 4, 5}:
+    failures.append("the first headset should have measured a 4-step press")
+elif router.by_addr["BB:BB:BB:BB:BB:BB"].steps:
+    failures.append("the second headset never completed a gesture and must stay unmeasured")
+elif voice.load_learned_steps().get("AA:AA:AA:AA:AA:AA") != frozenset({3, 4, 5}):
+    failures.append("the measurement should have been written to disk")
+else:
+    print("PASS  each headset keeps its own step, saved under its own address")
+
+# A headset that disconnects loses its baseline and keeps its measurement: the volume it comes
+# back at is not the one it left at, but the hardware did not change in the drawer.
+router.forget("AA:AA:AA:AA:AA:AA")
+if router.detector("AA:AA:AA:AA:AA:AA").prev is not None:
+    failures.append("a reconnected headset must not keep a stale baseline")
+elif set(router.detector("AA:AA:AA:AA:AA:AA").steps) != {3, 4, 5}:
+    failures.append("a reconnected headset should not have to be measured again")
+else:
+    print("PASS  disconnecting drops the baseline and keeps the measurement")
+
 if failures:
     print()
     for f in failures:
@@ -262,4 +494,6 @@ if failures:
     sys.exit(1)
 
 print(f"      {len(CASES) + len(LIST_CASES) + len(FLAG_CASES)} sequences, "
-      "all five clauses covered, both gesture directions")
+      "all five clauses covered, both gesture directions,")
+print(f"      and clause 3 measuring itself across {len(STEP_MATH)} step sizes "
+      "and two headsets at once")

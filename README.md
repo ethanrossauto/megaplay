@@ -59,7 +59,7 @@ the right numbers depend on your headset and your desktop and you will want to c
 |---|---|---|---|
 | 1 | one change down, one change back up | not tunable | your desktop volume slider |
 | 2 | the return lands on the exact starting value | not tunable | an ordinary adjustment |
-| 3 | the drop is exactly this many units | `VOICE_GESTURE_STEP` | anything that is not a headset button |
+| 3 | the press is one of the sizes your headset makes | measures itself | anything that is not a headset button |
 | 4 | at least this long between the two presses | `VOICE_GESTURE_MIN` | a fast ramp shaped like a press |
 | 5 | at most this long between them | `VOICE_GESTURE_WINDOW` | two unrelated adjustments |
 
@@ -69,9 +69,59 @@ step down and fire on the first step back up. It looks identical to a real gestu
 A headset button sends exactly one change per press, and a slider sends many, which is the whole
 distinction.
 
-Clause 3 ships disabled, because the step size is a property of your headset rather than of this
-software, and a wrong guess rejects every gesture you make. Every accepted gesture logs its step
-size, so make one, read the number off the log, and set it.
+Clause 3 configures itself, and it has to. The step size is a
+property of your headset rather than of this software: one of mine presses in steps of 7 or 8,
+another in steps of 4. Set by hand it describes exactly one headset, and plugging in a different
+pair means the gesture silently stops working while every other clause passes.
+
+**A headset does not have one step size.** It has N volume
+steps spread over a range of 0 to 127, and 127 divides evenly by nothing, so its presses come out
+as two adjacent sizes: mostly one, occasionally the other. Pin it by hand to the size you happened to
+observe and the gesture dies at the volumes sitting on the other one, and nowhere else, which
+reads as flaky hardware rather than as a setting.
+
+So a measured press is treated as a *neighbourhood*, the size seen and one either side, rather
+than as an exact grid. The first version of this was cleverer and wrong: it recovered the step
+count as `round(127/press)` and returned that grid exactly, which is a precise answer computed
+from an imprecise sample. Real hardware disproved it in about a minute. One headset pressed
+68 to 64 and then, seconds later, 64 to 59: a step of four, then a step of five. Taken alone
+each sample claims a different headset, 32 steps or 25, and each one excludes the other real
+size. A neighbourhood covers both. A slider notch of one or two units is still refused outright, which is the clause's job.
+
+The measurement is only ever taken from a pair that has already satisfied the other four
+clauses. A lone volume change could be anything; one that is part of a symmetric,
+correctly-timed, one-out-one-back pair is a gesture, and nothing but a person pressing a button
+twice makes that shape.
+
+**The first gesture on a headset the daemon has never seen still works**, and getting that right took
+more than leaving clause 3 open. Clause 2 was then the strict one, and a brand new headset is
+exactly the case whose baseline is wrong: the audio stack writes its own absolute volume when a
+device connects, and it does not land on the headset's step grid. So the chain was circular.
+Clause 2 forgives a drifted baseline only when clause 3 can recognise a press, clause 3 needs a
+measurement, and the measurement needs a gesture that got past clause 2. Buy a headset, press
+the button, nothing happens.
+
+So clause 2 forgives a miss while a headset is unmeasured. That is safe for a specific reason: a button moves the volume along the *headset's* own grid, so a real gesture
+cannot land anywhere except where it started, and if the return misses then the miss is an error
+in the value this machine remembered rather than something you did. It is bounded to the
+unmeasured case, so at most one gesture per device, and only when the return leg is button-sized
+and misses by less than its own length. A slider notch is still refused.
+
+One detail that matters: the *return* leg is what gets measured, not the drop. The drop is
+measured against the value that is wrong, so on a drifted first gesture it reads 5 where the
+truth is 4. The rise is measured between two numbers the headset itself reported. Believing the
+drop would write the drift into the measurement permanently.
+
+It also corrects itself. A measurement is the one thing here that can be wrong about the device
+rather than about the gesture, and a wrong one would refuse every real press forever, so three
+pairs in a row that fail on the step size and nothing else are taken as proof the number is
+wrong. Sizes are kept per bluetooth address, so swapping between headsets costs one gesture
+each, once. `VOICE_GESTURE_STEP` still pins it by hand if you want, and a value you set is never
+overruled.
+
+Each headset also gets its own detector. All of the state here is about one device, and with two
+connected their volume events used to interleave into a single state machine, so a press on the
+one you are wearing arrived as the return leg of something the other had done.
 
 When a pair arms and then fails, the log says which clause rejected it and why:
 
@@ -179,6 +229,53 @@ ruled out. Every turn lands in `.state/voice.log` next to the transcript that pr
 
 That log is also the only honest way to tune the thing. Every prompt rule in `voice.py` came
 from reading a turn that went wrong.
+
+### The same turns, as rows you can query
+
+The text log above is prose, it is rotated, and it is one process's memory of what it printed.
+It cannot tell you how often the model was called, how often a decision was refused for asking
+for a folder that is not there, or what happened to a track you have since replaced. So the
+same events are also written as rows, into a small SQLite file at `.state/audit.db`.
+
+```sh
+bin/audit.py                  the last 20 commands, grouped, newest first
+bin/audit.py --command <id>   one command and everything it caused
+bin/audit.py --track <path>   every row naming one track, even a deleted one
+bin/audit.py --since <id>     rows newer than a cursor, for anything that polls
+bin/audit.py --json           one JSON object per line
+```
+
+```
+2026-09-06 22:14:03  voice   3f9c1a20
+    ok   listen              7.4s  put something on
+    ok   dispatch     llm   11.8s  No specific request was made, so I picked the biggest...
+    ok   play         llm         started 90's and 2000's Rap
+```
+
+One gesture is one `command_id`, and the three rows under it are what was heard, what was
+decided, and what ran. A few things about the shape are deliberate:
+
+- **The decision row is written before the effect reaches the player**, so a crash between
+  deciding and playing still leaves the intent on the record.
+- **`tier` is `llm` only on the rows that cost a model call.** The capture, the flag gesture
+  and the daemon starting are all `null`, and they are most of the table. That makes "the
+  model is only called when it earns its latency" something you can query rather than
+  something this README claims.
+- **`rejected` and `error` are different outcomes, not severities.** Refusing a folder that is
+  not on disk is the system working; a player that will not answer is not. Fold them together
+  and you cannot ask how often the model requests something impossible, which is the number
+  that tells you whether the prompt is working.
+- **The track path carries no foreign key and points at nothing.** Files move: the swapper
+  replaces a bad download, a folder gets renamed for the card's filesystem, a playlist is
+  deleted. A log that forgot a track when its file went away would lose the one question it
+  exists to answer.
+- **`clarify` is a permitted outcome and nothing ever writes it.** There is no reply channel,
+  so the daemon is built to pick rather than ask. Keeping the value means that rule is
+  checkable: if `select count(*) from events where result = 'clarify'` is ever anything but
+  zero, the design changed without anybody saying so.
+
+Every exit of the function that turns a decision into playback writes one of these rows, the
+refusals included, and the test suite drives all fifteen of them to prove it.
 
 ### It talks while it thinks, and never the same way twice
 
@@ -458,6 +555,8 @@ bin/swap-track.sh <listfile>           re-source the listed tracks, keeping a ne
 bin/sync-phone.sh [--dry-run] [--force-all]   mirror the library to the SD card
 bin/play.sh [name]                     shuffle-play, detached, media keys work
 bin/voice.sh install|start|stop|status|logs|selftest
+bin/audit.py [--limit N] [--command ID] [--track PATH] [--json]
+                                       read back what the voice control decided, and why
 ```
 
 Nest a source under a megaplaylist by passing the name with a parent prefix:
